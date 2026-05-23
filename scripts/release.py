@@ -78,6 +78,8 @@ AUTHOR_MAP = {
     "ytchen0719@gmail.com": "liquidchen",
     "am@studio1.tailb672fe.ts.net": "subtract0",
     "mike@grossmann.at": "ReqX",
+    "hermes-pi@raspberrypi.local": "ether-btc",
+    "z2vtxybr9q@snkmail.com": "ether-btc",
     "axmaiqiu@gmail.com": "qWaitCrypto",
     "44045911+kidonng@users.noreply.github.com": "kidonng",
     "daniellsmarta@gmail.com": "DanielLSM",
