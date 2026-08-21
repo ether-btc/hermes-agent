@@ -131,6 +131,7 @@ export default defineConfig(({ command }) => ({
     // imports stay lazy, and the file count stays in the tens.
     chunkSizeWarningLimit: 25000,
     rolldownOptions: {
+      checks: { pluginTimings: false }, // Silence plugin-timings diagnostic.
       output: {
         advancedChunks: {
           groups: [

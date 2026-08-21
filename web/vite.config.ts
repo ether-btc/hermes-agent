@@ -111,6 +111,7 @@ export default defineConfig({
     // imports in App.tsx create the route boundaries; these groups keep
     // shared node_modules out of every page chunk.
     rolldownOptions: {
+      checks: { pluginTimings: false }, // Silence plugin-timings diagnostic.
       output: {
         codeSplitting: {
           minSize: 20_000,
