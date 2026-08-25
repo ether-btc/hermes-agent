@@ -1756,6 +1756,7 @@ class GatewaySlashCommandsMixin:
           /model <name>                       — switch model (this session only)
           /model <name> --once                — switch for the next turn only
           /model <name> --session             — switch for this session only (explicit)
+          /model <name> --chat                — switch for this chat across conversations
           /model <name> --global              — switch and persist to config.yaml
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
@@ -1777,7 +1778,7 @@ class GatewaySlashCommandsMixin:
                 self, "_resolve_profile_home_for_source"
             )(source)
 
-        # Parse --provider, --global, --session, --once, and --refresh flags
+        # Parse --provider, --global, --session, --chat, --once, and --refresh flags
         # via the shared single-owner parser (hermes_cli.model_switch).
         request = parse_model_switch_args(raw_args)
         model_input = request.target
@@ -1785,6 +1786,7 @@ class GatewaySlashCommandsMixin:
         is_global_flag = request.is_global
         force_refresh = request.force_refresh
         is_session = request.is_session
+        is_chat = request.is_chat
         one_turn = request.is_once
         if request.errors:
             # Gateway decoration: "❌ " prefix over the canonical error copy.
@@ -1813,6 +1815,7 @@ class GatewaySlashCommandsMixin:
         custom_provs = None
         excluded_provs = []
         config_path = (_command_profile_home or _hermes_home) / "config.yaml"
+        cfg = {}
         try:
             cfg = _load_gateway_config(config_path=config_path)
             if cfg:
@@ -1832,6 +1835,16 @@ class GatewaySlashCommandsMixin:
                     excluded_provs = _excl
         except Exception:
             pass
+
+        model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+        persist_chat_by_default = bool(
+            isinstance(model_cfg, dict)
+            and model_cfg.get("persist_chat_by_default", False)
+        )
+        if request.scope == "default" and persist_chat_by_default:
+            is_chat = True
+        if is_chat:
+            persist_global = False
 
         # Check for session override. Normalize the source the same way a normal
         # message turn does
@@ -2018,6 +2031,7 @@ class GatewaySlashCommandsMixin:
                             await _self.async_session_store.set_model_override(
                                 _session_key,
                                 _self._session_model_overrides[_session_key],
+                                chat_sticky=is_chat,
                             )
                         except Exception:
                             logger.debug(
@@ -2135,8 +2149,11 @@ class GatewaySlashCommandsMixin:
                             lines.append(t("gateway.model.warning_prefix", warning=result.warning_message))
                         if persist_global:
                             lines.append(t("gateway.model.saved_global"))
+                        elif is_chat:
+                            lines.append("    Saved for this chat across conversations.")
                         else:
                             lines.append(t("gateway.model.session_only_hint"))
+                            lines.append("    Use --chat to keep it for this chat across conversations.")
                         return "\n".join(lines)
 
                     async def _on_model_selected(
@@ -2348,6 +2365,7 @@ class GatewaySlashCommandsMixin:
                     await self.async_session_store.set_model_override(
                         session_key,
                         self._session_model_overrides[session_key],
+                        chat_sticky=is_chat,
                     )
                 except Exception:
                     logger.debug(
@@ -2474,8 +2492,11 @@ class GatewaySlashCommandsMixin:
                 lines.append(t("gateway.model.saved_global"))
             elif one_turn:
                 lines.append("    (next turn only — restores after one response)")
+            elif is_chat:
+                lines.append("    Saved for this chat across conversations.")
             else:
                 lines.append(t("gateway.model.session_only_hint"))
+                lines.append("    Use --chat to keep it for this chat across conversations.")
 
             return "\n".join(lines)
 

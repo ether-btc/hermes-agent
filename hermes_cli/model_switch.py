@@ -639,6 +639,7 @@ class ModelFlagParseResult:
     force_refresh: bool = False
     is_session: bool = False
     is_once: bool = False
+    is_chat: bool = False
 # ---------------------------------------------------------------------------
 # Flag parsing
 # ---------------------------------------------------------------------------
@@ -671,11 +672,12 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
     force_refresh = False
     is_session = False
     is_once = False
+    is_chat = False
 
     # Normalize Unicode dashes (Telegram/iOS auto-converts -- to em/en dash)
     # A single Unicode dash before a flag keyword becomes "--"
     import re as _re
-    raw_args = _re.sub(r'[\u2012\u2013\u2014\u2015](provider|global|session|refresh|once)', r'--\1', raw_args)
+    raw_args = _re.sub(r'[\u2012\u2013\u2014\u2015](provider|global|session|chat|refresh|once)', r'--\1', raw_args)
 
     # Keep this hand-rolled because model IDs may contain colons/slashes and
     # the historical parser did not require shell quoting.
@@ -688,6 +690,9 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
             i += 1
         elif parts[i] == "--session":
             is_session = True
+            i += 1
+        elif parts[i] == "--chat":
+            is_chat = True
             i += 1
         elif parts[i] == "--refresh":
             force_refresh = True
@@ -709,6 +714,7 @@ def parse_model_flags_detailed(raw_args: str) -> ModelFlagParseResult:
         is_global=is_global,
         force_refresh=force_refresh,
         is_session=is_session,
+        is_chat=is_chat,
         is_once=is_once,
     )
 
@@ -819,6 +825,7 @@ class ModelSwitchRequest:
     explicit_provider: str = ""
     is_global: bool = False
     is_session: bool = False
+    is_chat: bool = False
     is_once: bool = False
     force_refresh: bool = False
     scope: str = "default"
@@ -838,6 +845,7 @@ class ModelSwitchRequest:
             is_global=self.is_global,
             force_refresh=self.force_refresh,
             is_session=self.is_session,
+            is_chat=self.is_chat,
             is_once=self.is_once,
         )
 
@@ -877,6 +885,8 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
         scope = "once"
     elif parsed.is_session:
         scope = "session"
+    elif parsed.is_chat:
+        scope = "chat"
     elif parsed.is_global:
         scope = "global"
     else:
@@ -888,6 +898,7 @@ def parse_model_switch_args(raw: str) -> ModelSwitchRequest:
         explicit_provider=parsed.explicit_provider,
         is_global=parsed.is_global,
         is_session=parsed.is_session,
+        is_chat=parsed.is_chat,
         is_once=parsed.is_once,
         force_refresh=parsed.force_refresh,
         scope=scope,

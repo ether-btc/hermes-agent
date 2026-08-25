@@ -5,7 +5,10 @@ verbatim from hermes_cli/config.py. Must not import from hermes_cli.config.
 """
 
 DEFAULT_CONFIG = {
-    "model": "",
+    "model": {
+        "default": "",
+        "persist_chat_by_default": False,
+    },
     "providers": {},
     "fallback_providers": [],
     "credential_pool_strategies": {},

@@ -13967,7 +13967,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         # state.db (single write-path, #9006) — also drops
                         # the persisted /model override, since finalization
                         # is a conversation boundary.
-                        await self.async_session_store.set_expiry_finalized(entry)
+                        await self.async_session_store.set_expiry_finalized(
+                            entry,
+                            clear_model_override=not getattr(
+                                self.config,
+                                "persist_chat_model_by_default",
+                                False,
+                            ) and not getattr(
+                                entry, "model_override_chat_sticky", False
+                            ),
+                        )
                         logger.debug(
                             "Session expiry finalized for %s",
                             entry.session_id,

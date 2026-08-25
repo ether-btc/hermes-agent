@@ -870,6 +870,7 @@ class SessionEntry:
     # override is rehydrated after a restart and are never written to disk
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
+    model_override_chat_sticky: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -914,6 +915,8 @@ class SessionEntry:
             # Defence-in-depth: strip credentials even if a caller stored an
             # unsanitized dict directly on the entry.
             result["model_override"] = sanitize_model_override(self.model_override)
+        if self.model_override_chat_sticky:
+            result["model_override_chat_sticky"] = True
         if self.origin:
             result["origin"] = self.origin.to_dict()
         return result
@@ -1003,6 +1006,7 @@ class SessionEntry:
             reset_had_activity=data.get("reset_had_activity", False),
             prev_session_id=data.get("prev_session_id"),
             model_override=sanitize_model_override(data.get("model_override")),
+            model_override_chat_sticky=bool(data.get("model_override_chat_sticky", False)),
         )
 
 
@@ -1280,6 +1284,7 @@ class SessionStore:
         self._legacy_slack_claim_lock = threading.Lock()
         self._claimed_legacy_slack_keys: set[str] = set()
         self._transcript_retry_lock = threading.Lock()
+
         # Exactly one transcript drainer mutates routing/queues at a time. SQLite
         # serializes writes anyway; this outer lock also makes parent->child
         # queue migration and routing publication linearizable.
@@ -1326,6 +1331,18 @@ class SessionStore:
             lock=self._db_handles_lock,
         )
         self._open_session_db_for_active_scope()
+
+    def _chat_sticky_model_override(
+        self, entry: Optional[SessionEntry]
+    ) -> Optional[Dict[str, str]]:
+        """Return the override that should cross a conversation boundary."""
+        if entry is None or not entry.model_override:
+            return None
+        if entry.model_override_chat_sticky or getattr(
+            self.config, "persist_chat_model_by_default", False
+        ):
+            return dict(entry.model_override)
+        return None
 
     def _open_session_db_for_active_scope(self):
         """Return the SessionDB for the profile scope active on this task.
@@ -2786,6 +2803,7 @@ class SessionStore:
         auto_reset_reason = None
         reset_had_activity = False
         prev_session_id: Optional[str] = None
+        carried_model_entry: Optional[SessionEntry] = force_new_observed_entry
 
         with self._lock:
             self._ensure_loaded_locked()
@@ -2824,6 +2842,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        carried_model_entry = entry
                     entry = None
                     _needs_recover = True
                 elif entry.session_id != _stale_session_id:
@@ -2842,6 +2861,7 @@ class SessionStore:
                         reset_had_activity = entry.last_prompt_tokens > 0
                         db_end_session_id = entry.session_id
                         prev_session_id = entry.session_id
+                        carried_model_entry = entry
                         self._entries.pop(session_key, None)
                         entry = None
                         _needs_recover = True
@@ -2871,6 +2891,7 @@ class SessionStore:
                     reset_had_activity = recovered.reset_had_activity
                     db_end_session_id = recovered.session_id
                     prev_session_id = recovered.session_id
+                    carried_model_entry = recovered
                 else:
                     try:
                         self._db.reopen_session(recovered.session_id)
@@ -2892,6 +2913,9 @@ class SessionStore:
             # Create a candidate outside the lock, then publish only if another
             # worker has not already populated this routing key.
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            carried_model_override = self._chat_sticky_model_override(
+                carried_model_entry
+            )
             candidate = SessionEntry(
                 session_key=session_key,
                 session_id=session_id,
@@ -2905,6 +2929,8 @@ class SessionStore:
                 auto_reset_reason=auto_reset_reason,
                 reset_had_activity=reset_had_activity,
                 prev_session_id=prev_session_id,
+                model_override=carried_model_override,
+                model_override_chat_sticky=bool(carried_model_override),
             )
             with self._lock:
                 current = self._entries.get(session_key)
@@ -3082,7 +3108,7 @@ class SessionStore:
             return True
 
     def set_model_override(
-        self, session_key: str, override: Optional[Dict[str, Any]]
+        self, session_key: str, override: Optional[Dict[str, Any]], *, chat_sticky: bool = False
     ) -> None:
         """Persist (or clear) the session-scoped /model override.
 
@@ -3098,9 +3124,13 @@ class SessionStore:
             if entry is None:
                 return
             cleaned = sanitize_model_override(override)
-            if entry.model_override == cleaned:
+            if (
+                entry.model_override == cleaned
+                and entry.model_override_chat_sticky == chat_sticky
+            ):
                 return
             entry.model_override = cleaned
+            entry.model_override_chat_sticky = bool(cleaned) and chat_sticky
             self._save()
 
     def get_model_override(self, session_key: str) -> Optional[Dict[str, str]]:
@@ -3416,6 +3446,7 @@ class SessionStore:
             now = _now()
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
 
+            carried_model_override = self._chat_sticky_model_override(old_entry)
             new_entry = SessionEntry(
                 session_key=session_key,
                 session_id=session_id,
@@ -3425,6 +3456,8 @@ class SessionStore:
                 display_name=display_name if display_name is not None else old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                model_override=carried_model_override,
+                model_override_chat_sticky=bool(carried_model_override),
                 is_fresh_reset=True,
             )
 
@@ -3558,6 +3591,7 @@ class SessionStore:
             db_end_session_id = old_entry.session_id
 
             now = _now()
+            carried_model_override = self._chat_sticky_model_override(old_entry)
             new_entry = SessionEntry(
                 session_key=session_key,
                 session_id=target_session_id,
@@ -3567,6 +3601,8 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
+                model_override=carried_model_override,
+                model_override_chat_sticky=bool(carried_model_override),
             )
 
             self._entries[session_key] = new_entry
