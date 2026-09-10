@@ -432,12 +432,23 @@ def make_tool_result_message(
     return message
 
 
-# Tools whose results carry attacker-controllable content; outputs under 32 chars skip wrapping.
-_UNTRUSTED_TOOL_NAMES = frozenset({"web_extract", "web_search"})
-_UNTRUSTED_TOOL_PREFIXES = ("browser_", "mcp_")
-_UNTRUSTED_WRAP_MIN_CHARS = 32
+# Tools whose results carry attacker-controllable content. Wrapping their
+# string output in ``<untrusted_tool_result>`` delimiters tells the model the
+# payload is data, not instructions — the architectural piece of the
+# promptware defense.
+_UNTRUSTED_TOOL_NAMES = frozenset({
+    "web_extract",
+    "web_search",
+})
 
-# Case-insensitive so a differently-cased tag can't forge or prematurely close the boundary.
+_UNTRUSTED_TOOL_PREFIXES = (
+    "browser_",
+    "mcp_",
+)
+
+# Matches the delimiter token in any case so attacker content can't forge or
+# prematurely close the boundary with a differently-cased variant the model
+# would still read as a tag (e.g. ``</UNTRUSTED_TOOL_RESULT>``).
 _DELIMITER_TOKEN_RE = re.compile(r"untrusted_tool_result", re.IGNORECASE)
 
 
@@ -513,16 +524,18 @@ def _neutralize_delimiters(content: str) -> str:
 
 
 def _maybe_wrap_untrusted(name: str, content: Any) -> Any:
-    """Wrap high-risk tool content in untrusted-data delimiters: strings are neutralized and
-    wrapped in exactly one block; text parts of a multimodal list are wrapped individually
-    (outer list rebuilt — compare by value, not ``is``). Unchanged for non-high-risk tools,
-    non-str/list content, or short strings. Deliberately no "already wrapped" fast-path:
-    it would be attacker-forgeable, so harmless re-wrapping is the safe choice."""
+    """Wrap content from high-risk tools in untrusted-data delimiters.
+
+    Handles plain string content and multimodal content lists
+    (`[{"type": "text", "text": "..."}, {"type": "image_url", ...}]`).
+    Text parts inside a multimodal list are wrapped individually; non-text parts
+    are preserved unchanged. Content from these tools is always wrapped,
+    including short strings, because short attacker-controlled output can still
+    carry an instruction.
+    """
     if not _is_untrusted_tool(name):
         return content
     if isinstance(content, str):
-        if len(content) < _UNTRUSTED_WRAP_MIN_CHARS:
-            return content
         safe_content = _neutralize_delimiters(content)
         return (
             f'<untrusted_tool_result source="{name}">\n'
