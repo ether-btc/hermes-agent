@@ -84,10 +84,10 @@ class TestUntrustedWrapping:
         assert result == SAMPLE_LONG_TEXT
         assert "<untrusted_tool_result" not in result
 
-    def test_does_not_wrap_short_content(self):
-        # Short outputs aren't worth the wrapper overhead.
+    def test_short_content_is_wrapped(self):
         result = _maybe_wrap_untrusted("web_extract", "ok")
-        assert result == "ok"
+        assert result.startswith('<untrusted_tool_result source="web_extract">')
+        assert result.endswith("</untrusted_tool_result>")
 
     def test_does_not_wrap_non_string_content(self):
         # Multimodal results (content lists with image_url parts) must
