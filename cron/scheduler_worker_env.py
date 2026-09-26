@@ -37,6 +37,15 @@ def pin_hermes_tree_on_pythonpath(worker_env: dict, repo_root: Path) -> dict:
     root = str(repo_root)
     if _installed_purelib() == Path(root).resolve():
         return worker_env
+    # The shared sanitizer stripped BOTH Hermes-owned entries — the checkout and the
+    # runtime site-packages that actually hold the dependency graph (the interpreter
+    # itself carries only pip). The worker is a Hermes child that must import the tree,
+    # so restore exactly the site-packages the stripper itself classifies as owned:
+    # the same helper is the stripper's own ownership test, which keeps the restored set
+    # the exact inverse of the strip and widens nothing for user children.
+    from tools.environments.local_pythonpath import _get_hermes_site_packages
+
+    owned = [str(p) for p in _get_hermes_site_packages(worker_env) if Path(p).is_dir()]
     existing = [e for e in worker_env.get("PYTHONPATH", "").split(os.pathsep) if e]
-    worker_env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys([root, *existing]))
+    worker_env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys([root, *owned, *existing]))
     return worker_env
