@@ -466,10 +466,10 @@ def make_tool_result_message(
     return message
 
 
-# Tools whose results carry attacker-controllable content; outputs under 32 chars skip wrapping.
+# Tools whose results carry attacker-controllable content; all text is wrapped.
 _UNTRUSTED_TOOL_NAMES = frozenset({"web_extract", "web_search"})
 _UNTRUSTED_TOOL_PREFIXES = ("browser_", "mcp_")
-_UNTRUSTED_WRAP_MIN_CHARS = 32
+_UNTRUSTED_WRAP_MIN_CHARS = 0
 
 # Case-insensitive so a differently-cased tag can't forge or prematurely close the boundary.
 _DELIMITER_TOKEN_RE = re.compile(r"untrusted_tool_result", re.IGNORECASE)
@@ -549,8 +549,9 @@ def _neutralize_delimiters(content: str) -> str:
 def _maybe_wrap_untrusted(name: str, content: Any) -> Any:
     """Wrap high-risk tool content in untrusted-data delimiters: strings are neutralized and
     wrapped in exactly one block; text parts of a multimodal list are wrapped individually
-    (outer list rebuilt — compare by value, not ``is``). Unchanged for non-high-risk tools,
-    non-str/list content, or short strings. Deliberately no "already wrapped" fast-path:
+    (outer list rebuilt — compare by value, not ``is``). All text is wrapped, including
+    short and empty strings. Unchanged for non-high-risk tools and non-str/list content.
+    Deliberately no "already wrapped" fast-path:
     it would be attacker-forgeable, so harmless re-wrapping is the safe choice."""
     if not _is_untrusted_tool(name):
         return content
