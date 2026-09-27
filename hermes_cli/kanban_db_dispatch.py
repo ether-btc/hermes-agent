@@ -2471,22 +2471,18 @@ def _module_hermes_argv() -> list[str]:
     """Interpreter-bound Hermes CLI invocation (``hermes_cli.main`` is the
     console-script target — there is no top-level ``hermes`` package).
 
-    ``sys.executable`` alone is NOT enough. When the dispatcher runs on a
-    managed Hermes runtime, that interpreter is launched with ``-I`` (isolated
-    mode) and no installed ``hermes_cli`` — the package exists only as a source
-    checkout under the repo root. A worker spawned with
-    ``[sys.executable, "-m", "hermes_cli.main"]`` and ``cwd=workspace`` (never
-    the repo root) therefore dies instantly with
-    ``ModuleNotFoundError: No module named 'hermes_cli'``; the circuit breaker
-    then blocks the card and it surfaces as "worker crashed" rather than
-    "runtime cannot import the package".
+    Prefer the published launcher: on a managed runtime ``hermes_cli`` is a
+    source checkout, not an install, and a worker is spawned with
+    ``cwd=workspace`` (never the repo root), so a bare
+    ``[sys.executable, "-m", "hermes_cli.main"]`` dies with
+    ``ModuleNotFoundError: No module named 'hermes_cli'`` — the child has no way
+    to locate the checkout from where it runs. ``.hermes/bin/hermes`` resolves
+    the package regardless of cwd (and strips any inherited ``PYTHONPATH``, so
+    the resolution cannot be redirected from outside).
 
-    The published launcher at ``.hermes/bin/hermes`` is the supported entry
-    point: it is a ``-I`` shim that strips ``PYTHONPATH`` (so an inherited or
-    poisoned value cannot leak in) and inserts the repo root on ``sys.path``
-    itself. Preferring it makes the worker independent of both cwd and the
-    caller's environment. Falls back to the interpreter form only when no
-    launcher is published (e.g. isolated test fixtures).
+    Falls back to the interpreter form when no launcher is published (isolated
+    test fixtures); that fallback is correct only where the child interpreter
+    can import Hermes on its own.
     """
     launcher = Path(__file__).resolve().parent.parent / ".hermes" / "bin" / "hermes"
     if launcher.is_file() and os.access(launcher, os.X_OK):
