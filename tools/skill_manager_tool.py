@@ -14,6 +14,7 @@ from contextlib import ExitStack, suppress
 import logging
 import re
 import shutil
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -343,26 +344,37 @@ def _locate_for_write(name: str, action: str, not_found_suffix: str = ""):
     return (None, guard) if guard else (skill_dir, None)
 
 
+_guarded_write_locks_guard = threading.Lock()
+_guarded_write_locks: Dict[str, threading.Lock] = {}
+
+
+def _guarded_write_lock(target: Path) -> threading.Lock:
+    key = str(target.resolve())
+    with _guarded_write_locks_guard:
+        return _guarded_write_locks.setdefault(key, threading.Lock())
+
+
 def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label: str,
                    content: str) -> Optional[Dict[str, Any]]:
     """Read-before-write guard (existing targets only), atomic write, then the security scan;
     a blocked scan restores the original (or unlinks a new file). Error dict or None."""
-    original = None
-    if target.exists():
-        if read_guard := _background_review_read_before_write_guard(name, target, action, label):
-            return read_guard
-        original = target.read_text(encoding="utf-8-sig")
-    from hermes_constants import mkdir_under_hermes_home
-    mkdir_under_hermes_home(target.parent)
-    atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)
-    scan_error = _security_scan_skill(skill_dir)
-    if not scan_error:
-        return None
-    if original is not None:
-        atomic_write_text(target, original, preserve_mode=True)
-    else:
-        target.unlink(missing_ok=True)
-    return _err(scan_error)
+    with _guarded_write_lock(target):
+        original = None
+        if target.exists():
+            if read_guard := _background_review_read_before_write_guard(name, target, action, label):
+                return read_guard
+            original = target.read_text(encoding="utf-8-sig")
+        from hermes_constants import mkdir_under_hermes_home
+        mkdir_under_hermes_home(target.parent)
+        atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)
+        scan_error = _security_scan_skill(skill_dir)
+        if not scan_error:
+            return None
+        if original is not None:
+            atomic_write_text(target, original, preserve_mode=True)
+        else:
+            target.unlink(missing_ok=True)
+        return _err(scan_error)
 
 
 def _add_description_prompt_preview(result: Dict[str, Any], content: str) -> Dict[str, Any]:
