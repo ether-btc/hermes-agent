@@ -293,7 +293,7 @@ function target(user, host) {
 // Quote for the login shell sshd invokes. fish treats `\` inside `'…'`; POSIX
 // does not. Close the quote and escape outside it so both decode identically.
 function loginShellQuote(value: string) {
-  return `'${String(value).replace(/['\\]/g, ch => (ch === `'` ? `'\\''` : `'\\\\'`))}'`
+  return `'${String(value).replace(/'/g, `'\\''`)}'`
 }
 
 function buildExecArgs(conn, remoteCommand, connectTimeoutMs?) {
