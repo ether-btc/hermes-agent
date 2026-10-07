@@ -8,6 +8,7 @@ existing skills (bundled, hub, user) are modified in place. Layout:
 """
 
 import contextvars as _ctxvars
+import datetime as _datetime
 import hashlib
 import json
 from contextlib import ExitStack, suppress
@@ -18,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import hermes_yaml as yaml
+import yaml as _pyyaml
 
 from hermes_constants import get_hermes_home
 from utils import atomic_write_text, is_truthy_value
@@ -493,6 +495,8 @@ def _create_skill(name: str, content: str, category: str = None) -> Dict[str, An
 
 def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
+    if not _preserve_evidence_suspended.get():
+        content = _preserve_evidence(name, content)
     if err := _validate_frontmatter(content) or _validate_content_size(content):
         return _err(err)
     skill_dir, guard = _locate_for_write(name, "edit")
@@ -543,6 +547,8 @@ def _patch_skill(name: str, old_string: str, new_string: str, file_path: str = N
         return _err(err)
     if not file_path and (err := _validate_frontmatter(new_content)):
         return _err(f"Patch would break SKILL.md structure: {err}")
+    if not file_path and not _preserve_evidence_suspended.get():
+        new_content = _preserve_evidence(name, new_content)
     if guard := _guarded_write(name, skill_dir, target, "patch", target_label, new_content):
         return guard
     result = {
@@ -650,6 +656,12 @@ def _remove_file(name: str, file_path: str) -> Dict[str, Any]:
 _skill_gate_bypass: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
     "skill_gate_bypass", default=False)
 
+# Suspends universal evidence preservation; set during evidence_merge so the
+# freshly merged evidence block is written as-is instead of being re-injected
+# from the pre-merge frontmatter.
+_preserve_evidence_suspended: "_ctxvars.ContextVar[bool]" = _ctxvars.ContextVar(
+    "preserve_evidence_suspended", default=False)
+
 
 def _run_write_gate(build_staging):
     """Shared write gate: None to proceed, else a JSON tool result (blocked/staged).
@@ -670,21 +682,296 @@ def _run_write_gate(build_staging):
                        "gist": gist, "message": decision.message}, ensure_ascii=False)
 
 
+def _preserve_evidence(name: str, content: str) -> str:
+    """Re-inject the skill's current ``evidence`` frontmatter into ``content``.
+
+    Universal preservation: the evidence block survives ANY edit (a full
+    ``content`` rewrite or an ``old_string``/``new_string`` patch). Only the
+    frontmatter's ``evidence`` key is replaced — every other key and the body
+    are kept exactly as written. Returns ``content`` untouched when the skill
+    carries no evidence block, or when either document will not parse."""
+    found = _find_skill(name)
+    if found is None:
+        return content
+    skill_md = found["path"] / "SKILL.md"
+    if not skill_md.exists():
+        return content
+    try:
+        current = skill_md.read_text(encoding="utf-8-sig")
+    except OSError:
+        return content
+    current_fm, _ = _parse_frontmatter(current)
+    if not isinstance(current_fm, dict) or "evidence" not in current_fm:
+        return content
+    new_fm, body = _parse_frontmatter(content)
+    if not isinstance(new_fm, dict):
+        return content
+    new_fm["evidence"] = current_fm["evidence"]
+    prefix = "\ufeff" if content.startswith("\ufeff") else ""
+    return (prefix + "---\n" + yaml.safe_dump(
+        new_fm, sort_keys=False, default_flow_style=False, allow_unicode=True
+    ) + "---\n" + body)
+
+
+# --- Evidence merge (additive skill evidence frontmatter; re-implementation of the
+# local carry) ---------------------------------------------------------------
+#
+# Preservation is universal: the evidence block survives ANY edit (a full
+# content rewrite or an old_string/new_string patch) because _edit_skill and
+# _patch_skill re-inject the skill's current evidence via _preserve_evidence
+# before the write. evidence_merge is the additive-intent, counter-updating
+# path; it suspends preservation via _preserve_evidence_suspended so the
+# freshly merged block is written as-is.
+
+# Error texts for the evidence_merge patch shape.
+_EVIDENCE_MERGE_NO_FILE_PATH = (
+    "evidence_merge only applies to SKILL.md; do not pass file_path.")
+_EVIDENCE_MERGE_EITHER_OR = (
+    "Pass EITHER content, old_string/new_string, OR evidence_merge, not more than one patch shape.")
+_EVIDENCE_MERGE_STALE = (
+    "Stale evidence merge rejected: SKILL.md changed after the merge source was shown for "
+    "review; stage a new merge against the current source.")
+
+# Validation helpers for the evidence data model.
+def _evidence_int(value: Any, label: str) -> int:
+    """Coerce a monotonic counter; booleans are rejected (bool is a subclass of int)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer (got {type(value).__name__})")
+    return value
+
+
+def _evidence_list(value: Any, label: str) -> List[Any]:
+    """Coerce a list of evidence entries."""
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list (got {type(value).__name__})")
+    return value
+
+
+def _validate_evidence_entries(entries: List[Any], label: str, required: set) -> None:
+    """Validate one evidence list (steps or evolution)."""
+    seen = set()
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ValueError(f"{label}[{index}] must be a mapping")
+        missing = required - set(entry)
+        if missing:
+            raise ValueError(f"{label}[{index}] missing keys: {sorted(missing)}")
+        unknown = set(entry) - required
+        if unknown:
+            raise ValueError(f"{label}[{index}] unknown keys: {sorted(unknown)}")
+        if label.endswith("steps"):
+            name = entry["name"]
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"{label}[{index}].name must be a non-empty string")
+            if name in seen:
+                raise ValueError(f"{label} contains duplicate name: {name!r}")
+            seen.add(name)
+            for key in ("ok", "fail"):
+                if _evidence_int(entry[key], f"{label}[{index}].{key}") < 0:
+                    raise ValueError(f"{label}[{index}].{key} must be non-negative")
+        else:
+            for key in ("date", "reason"):
+                if not isinstance(entry[key], str) or not entry[key]:
+                    raise ValueError(f"{label}[{index}].{key} must be a non-empty string")
+            for key in ("from", "to"):
+                if _evidence_int(entry[key], f"{label}[{index}].{key}") < 0:
+                    raise ValueError(f"{label}[{index}].{key} must be non-negative")
+
+
+def _validate_evolution_chain(entries: List[Dict[str, Any]], version: Optional[int]) -> None:
+    """The evolution list must be contiguous and end exactly at ``version``."""
+    if entries and version is None:
+        raise ValueError("existing evolution requires version metadata")
+    if not entries:
+        return
+    expected_from = entries[0]["from"]
+    for entry in entries:
+        if entry["from"] != expected_from:
+            raise ValueError("existing evolution history is not contiguous")
+        if entry["to"] <= entry["from"]:
+            raise ValueError("existing evolution.to must be greater than evolution.from")
+        expected_from = entry["to"]
+    if expected_from != version:
+        raise ValueError("existing evolution must end at version")
+
+
+def _coerce_evidence_dates(entries):
+    """Coerce PyYAML-parsed ISO dates to plain strings: the evidence frontmatter stores
+    dates textually so unquoted ``YYYY-MM-DD`` frontmatter works without becoming
+    ``datetime.date`` objects."""
+    for entry in entries:
+        val = entry.get("date")
+        if isinstance(val, _datetime.date):
+            entry["date"] = val.isoformat()
+
+
+class _UniqueKeySafeLoader(_pyyaml.SafeLoader):
+    """Restricted YAML loader for SKILL.md frontmatter: only core scalars, lists
+    and mappings are allowed — no arbitrary Python object construction.
+    ``hermes_yaml.safe_load`` is already a safe loader; this is defence in depth
+    around the evidence frontmatter, which agents can influence."""
+
+    def construct_mapping(self, node, deep=False):
+        mapping = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if not isinstance(key, str):
+                raise _pyyaml.constructor.ConstructorError(
+                    "while constructing a mapping", node.start_mark,
+                    f"found unacceptable key {key!r}", key_node.start_mark)
+            value = self.construct_object(value_node, deep=deep)
+            mapping[key] = value
+        return mapping
+
+
+def _merge_evidence(skill_md: str, evidence_merge: Dict[str, Any]) -> str:
+    """Validate an additive evidence_merge payload and return the merged SKILL.md.
+
+    Reads the existing evidence frontmatter, merges ``success_count``/``fail_count``
+    (and ``steps`` by step name, summing ``ok``/``fail``), appends incoming
+    ``evolution`` entries, and bumps the ``version``/``updated`` metadata when a
+    transition is present. The body of the skill is untouched.
+    """
+    if not isinstance(evidence_merge, dict):
+        raise ValueError("evidence_merge must be a mapping")
+    keys = set(evidence_merge)
+    allowed = {"success_count", "fail_count", "steps", "evolution"}
+    if not keys:
+        raise ValueError("evidence_merge is empty")
+    if keys - allowed:
+        raise ValueError(f"unknown evidence_merge keys: {sorted(keys - allowed)}")
+
+    success_delta = _evidence_int(evidence_merge.get("success_count", 0), "success_count")
+    fail_delta = _evidence_int(evidence_merge.get("fail_count", 0), "fail_count")
+    if success_delta < 0 or fail_delta < 0:
+        raise ValueError("negative deltas rejected: counters are monotonic")
+    incoming_steps = _evidence_list(evidence_merge.get("steps", []), "steps")
+    incoming_evolution = _evidence_list(evidence_merge.get("evolution", []), "evolution")
+    _coerce_evidence_dates(incoming_evolution)
+    _validate_evidence_entries(incoming_steps, "steps", {"name", "ok", "fail"})
+    _validate_evidence_entries(incoming_evolution, "evolution", {"from", "to", "date", "reason"})
+
+    has_bom = skill_md.startswith("\ufeff")
+    fm, body = _parse_frontmatter(skill_md)
+    if not isinstance(fm, dict):
+        raise ValueError("SKILL.md frontmatter must be a YAML mapping")
+
+    if "evidence" not in fm:
+        existing = {}
+    else:
+        existing = fm["evidence"]
+        if not isinstance(existing, dict):
+            raise ValueError("malformed existing evidence: not a mapping")
+    existing_allowed = allowed | {"version", "updated"}
+    unknown_existing = set(existing) - existing_allowed
+    if unknown_existing:
+        raise ValueError(f"unknown existing evidence keys: {sorted(unknown_existing)}")
+    if ("version" in existing) != ("updated" in existing):
+        raise ValueError("version and updated metadata must appear together")
+    version = None
+    if "version" in existing:
+        version = _evidence_int(existing["version"], "existing version")
+        if version < 0:
+            raise ValueError("existing version must be non-negative")
+        if "updated" in existing:
+            upd = existing["updated"]
+            if isinstance(upd, _datetime.date):
+                existing["updated"] = upd.isoformat()
+        if not isinstance(existing["updated"], str) or not existing["updated"]:
+            raise ValueError("existing updated must be a non-empty string")
+
+    current_success = _evidence_int(existing.get("success_count", 0), "existing success_count")
+    current_fail = _evidence_int(existing.get("fail_count", 0), "existing fail_count")
+    if current_success < 0 or current_fail < 0:
+        raise ValueError("existing counters must be non-negative")
+    current_steps = _evidence_list(existing.get("steps", []), "existing steps")
+    current_evolution = _evidence_list(existing.get("evolution", []), "existing evolution")
+    _coerce_evidence_dates(current_evolution)
+    _validate_evidence_entries(current_steps, "existing steps", {"name", "ok", "fail"})
+    _validate_evidence_entries(current_evolution, "existing evolution", {"from", "to", "date", "reason"})
+    _validate_evolution_chain(current_evolution, version)
+
+    transition_version = version
+    for entry in incoming_evolution:
+        if transition_version is None:
+            raise ValueError("evolution requires an existing version")
+        if entry["from"] != transition_version:
+            raise ValueError("evolution.from must equal the current version")
+        if entry["to"] <= entry["from"]:
+            raise ValueError("evolution.to must be greater than evolution.from")
+        transition_version = entry["to"]
+
+    merged_steps = [dict(step) for step in current_steps]
+    steps_by_name = {step["name"]: step for step in merged_steps}
+    for incoming in incoming_steps:
+        prior = steps_by_name.get(incoming["name"])
+        if prior is None:
+            prior = dict(incoming)
+            merged_steps.append(prior)
+            steps_by_name[prior["name"]] = prior
+        else:
+            prior["ok"] += incoming["ok"]
+            prior["fail"] += incoming["fail"]
+
+    merged = {
+        "success_count": current_success + success_delta,
+        "fail_count": current_fail + fail_delta,
+        "steps": merged_steps,
+        "evolution": current_evolution + [dict(entry) for entry in incoming_evolution],
+    }
+    if version is not None:
+        merged["version"] = version
+        merged["updated"] = existing["updated"]
+    if incoming_evolution:
+        merged["version"] = transition_version
+        merged["updated"] = incoming_evolution[-1]["date"]
+    fm["evidence"] = merged
+    prefix = "\ufeff" if has_bom else ""
+    return prefix + "---\n" + yaml.safe_dump(fm, sort_keys=False, default_flow_style=False) + "---\n" + body
+
+
+# --- End evidence merge ------------------------------------------------------
+
+
 def _apply_skill_write_gate(action, name, **payload_kwargs):
     """Flat-shape gate: stage the full kwargs so approval can replay them; bypassed during replay."""
     if action not in _ACTION_HANDLERS or _skill_gate_bypass.get():
         return None
+    if action == "patch" and payload_kwargs.get("evidence_merge") is not None:
+        # --- evidence_merge preflight (validation + merge for the review view) ---
+        if payload_kwargs.get("file_path") is not None:
+            return _err(_EVIDENCE_MERGE_NO_FILE_PATH)
+        other = payload_kwargs.get("content") is not None or payload_kwargs.get("old_string") \
+                is not None or payload_kwargs.get("new_string") is not None
+        if other:
+            return _err(_EVIDENCE_MERGE_EITHER_OR)
+        skill_dir, guard = _locate_for_write(name, "evidence_merge")
+        if guard:
+            return guard
+        target = skill_dir / "SKILL.md"
+        if not target.exists():
+            return _err(f"File not found: {target.relative_to(skill_dir)}")
+        source = target.read_text(encoding="utf-8-sig")
+        try:
+            candidate = _merge_evidence(source, payload_kwargs["evidence_merge"])
+        except ValueError as e:
+            return _err(f"evidence_merge rejected: {e}")
+        source_digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        payload_kwargs = dict(payload_kwargs, evidence_candidate=candidate,
+                              evidence_source_digest=source_digest)
+        # --- end evidence_merge preflight ---
     def _staging(wa):
         payload = {"action": action, "name": name,
                    **{k: v for k, v in payload_kwargs.items() if v is not None}}
         gist_kw = {k: payload_kwargs.get(k) or ""
-                   for k in ("content", "file_path", "old_string", "new_string")}
+                   for k in ("content", "file_path", "old_string", "new_string",
+                             "evidence_candidate", "evidence_source_digest")}
         return payload, wa.skill_gist(action, name, **gist_kw)
     return _run_write_gate(_staging)
 
 
 _FLAT_OP_KEYS = ("content", "category", "file_path", "file_content", "old_string", "new_string",
-                 "absorbed_into", "operations")
+                 "absorbed_into", "operations", "evidence_merge")
 
 
 def _skill_manage_from(payload: Dict[str, Any], **extra) -> str:
@@ -705,13 +992,49 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
 
 
 def _act_patch(a):
-    """Two shapes: old_string/new_string = targeted replacement (validated in _patch_skill so the
-    tool and the helper give the same guidance); content alone = full rewrite (the old 'edit')."""
+    """Three shapes: old_string/new_string = targeted replacement (validated in _patch_skill so the
+    tool and the helper give the same guidance); content alone = full rewrite (the old 'edit');
+    evidence_merge = additive evidence record merged into the skill's evidence frontmatter."""
+    if a.get("evidence_merge") is not None:
+        return _act_evidence_merge(a)
     if a["content"] and (a["old_string"] or a["new_string"] is not None):
         return tool_error(_PATCH_EITHER_OR, success=False)
     if a["content"]:
         return _edit_skill(a["name"], a["content"])
     return _patch_skill(a["name"], a["old_string"], a["new_string"], a["file_path"], a["replace_all"])
+
+
+def _act_evidence_merge(a):
+    """Recompute the merge from the current SKILL.md (stale-source gate), then
+    apply it as a full rewrite under the existing mutation lock. Preservation is
+    suspended for the write so the candidate's freshly merged evidence block is
+    written as-is (universal re-injection would restore the pre-merge block)."""
+    name = a["name"]
+    skill_dir, guard = _locate_for_write(name, "evidence_merge")
+    if guard:
+        return guard
+    if skill_dir is None:
+        return {"success": False, "error": f"internal error: no skill directory for '{name}'"}
+    target = skill_dir / "SKILL.md"
+    source = target.read_text(encoding="utf-8-sig")
+    digest = a.get("evidence_source_digest")
+    if digest is not None and hashlib.sha256(source.encode("utf-8")).hexdigest() != digest:
+        return {"success": False, "error": _EVIDENCE_MERGE_STALE}
+    try:
+        candidate = _merge_evidence(source, a["evidence_merge"])
+    except ValueError as e:
+        return {"success": False, "error": f"evidence_merge rejected: {e}"}
+    if err := _validate_frontmatter(candidate) or _validate_content_size(candidate):
+        return _err(err)
+    token = _preserve_evidence_suspended.set(True)
+    try:
+        result = _edit_skill(name, candidate)
+    finally:
+        _preserve_evidence_suspended.reset(token)
+    if not isinstance(result, dict):
+        return result
+    result["message"] = f"Evidence merged into '{name}'"
+    return result
 
 
 # action -> handler(args dict) returning a result dict, or a tool_error JSON string for
@@ -765,8 +1088,8 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
 def skill_manage(
     action: str, name: str, content: str = None, category: str = None, file_path: str = None,
     file_content: str = None, old_string: str = None, new_string: str = None,
-    replace_all: bool = False, absorbed_into: str = None, task_id: str = None,
-    session_id: str = None, operations=None) -> str:
+    replace_all: bool = False, absorbed_into: str = None, evidence_merge: Optional[Dict[str, Any]] = None,
+    task_id: str = None, session_id: str = None, operations=None) -> str:
     """Dispatch to the action handler -> JSON string. ``operations`` (atomic batch shape,
     see _skill_manage_batch) overrides the flat fields."""
     if operations is not None:
@@ -778,7 +1101,7 @@ def skill_manage(
     # of origin; bypassed when replaying an approved staged write.
     args = dict(content=content, category=category, file_path=file_path, file_content=file_content,
                 old_string=old_string, new_string=new_string, replace_all=replace_all,
-                absorbed_into=absorbed_into)
+                absorbed_into=absorbed_into, evidence_merge=evidence_merge)
     if (gate_result := _apply_skill_write_gate(action, name, **args)) is not None:
         return gate_result
     if (shape_err := _op_shape_error(action, args)) is not None:
@@ -892,6 +1215,55 @@ SKILL_MANAGE_SCHEMA = {
                         "content": {"type": "string",
                                     "description": "Full SKILL.md rewrite (REPLACES the whole file; last resort)."},
                     }, ("content",)),
+                    _op_schema("patch", {
+                        "evidence_merge": {
+                            "type": "object",
+                            "description": (
+                                "Additive evidence record: sums existing step counters and appends "
+                                "new steps and evolution entries into the skill's evidence "
+                                "frontmatter. Valid ONLY with action='patch' on SKILL.md; never "
+                                "combine with content, old_string, new_string or file_path."
+                            ),
+                            "required": ["evidence_merge"],
+                            "properties": {
+                                "evidence_merge": {
+                                    "type": "object",
+                                    "required": [],
+                                    "properties": {
+                                        "success_count": {"type": "integer",
+                                                          "description": "Successful runs to add (>= 0)."},
+                                        "fail_count": {"type": "integer",
+                                                       "description": "Failing runs to add (>= 0)."},
+                                        "steps": {
+                                            "type": "array",
+                                            "description": "Steps to add or merge (by name), "
+                                                           "each with ok/fail counts.",
+                                            "items": {"type": "object",
+                                                      "required": ["name", "ok", "fail"],
+                                                      "properties": {
+                                                          "name": {"type": "string"},
+                                                          "ok": {"type": "integer"},
+                                                          "fail": {"type": "integer"},
+                                                      }}},
+                                        "evolution": {
+                                            "type": "array",
+                                            "description": "Evolution transitions (from->to), each "
+                                                           "dated and reasoned.",
+                                            "items": {"type": "object",
+                                                      "required": ["from", "to", "date", "reason"],
+                                                      "properties": {
+                                                          "from": {"type": "integer"},
+                                                          "to": {"type": "integer"},
+                                                          "date": {"type": "string"},
+                                                          "reason": {"type": "string"},
+                                                      }}},
+                                    },
+                                    "additionalProperties": False,
+                                },
+                            },
+                            "additionalProperties": False,
+                        },
+                    }, ()),
                     _op_schema("write_file", {
                         "file_path": _FILE_PATH,
                         "file_content": {"type": "string", "description": "Full text of the supporting file."},

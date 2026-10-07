@@ -74,6 +74,11 @@ def _op_shape_error(action: str, args: dict):
     if action == "patch":
         # Every patch shape miss is decided here, not in the handler, so a batch never applies
         # op[0] only to roll it back over op[1]'s missing new_string or content+old_string mix.
+        # ``evidence_merge`` is a valid third shape: the additive evidence path bypasses
+        # old_string/content/new_string entirely (the gate preflight enforces its own
+        # EITHER_OR against content/old_string — see skill_manager_tool._apply_skill_write_gate).
+        if args.get("evidence_merge") is not None:
+            return None
         if args.get("content") and (args.get("old_string") or args.get("new_string") is not None):
             return _PATCH_EITHER_OR
         if not args.get("old_string") and not args.get("content"):
