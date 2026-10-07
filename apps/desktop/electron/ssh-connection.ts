@@ -290,10 +290,17 @@ function target(user, host) {
   return user ? `${user}@${host}` : host
 }
 
-// Quote for the login shell sshd invokes. fish treats `\` inside `'…'`; POSIX
-// does not. Close the quote and escape outside it so both decode identically.
+// Quote for the login shell sshd invokes. Inside POSIX single quotes nothing is
+// special -- not even backslash -- so the only character to escape is the single
+// quote, done by closing the quote, an escaped quote outside, and reopening
+// ('\''). fish decodes the very same sequence identically (its only
+// single-quote escape), so one form serves both shells. Escaping backslashes here
+// (as an earlier revision did) corrupts every payload containing a quoted fragment:
+// the doubled backslashes survive the single-quote decode and the remote command
+// receives a backslash where it sent a quote on sh/dash remotes, e.g. the
+// Desktop's token-upload SSH call fails with `sh: 2: Syntax error: ")" unexpected`.
 function loginShellQuote(value: string) {
-  return `'${String(value).replace(/['\\]/g, ch => (ch === `'` ? `'\\''` : `'\\\\'`))}'`
+  return `'${String(value).replace(/'/g, `'\\''`)}'`
 }
 
 function buildExecArgs(conn, remoteCommand, connectTimeoutMs?) {
