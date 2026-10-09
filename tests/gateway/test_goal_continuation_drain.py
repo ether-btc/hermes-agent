@@ -202,3 +202,61 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
         f"drains: pending keys={list(adapter._pending_messages)} "
         f"expected={adapter_key}"
     )
+
+
+@pytest.mark.asyncio
+async def test_goal_continuation_enqueue_stamps_machinery_provenance(hermes_home):
+    """The synthetic goal continuation must carry ``_goal_continuation_provenance`` so
+    ``display_kind_for_event`` classifies it as machinery, not a NULL-kind user bubble."""
+    from unittest.mock import MagicMock, patch
+    from datetime import datetime
+    import uuid
+
+    from gateway.run import GatewayRunner
+    from gateway.config import GatewayConfig
+    from gateway.response_filters import display_kind_for_event
+    from gateway.session import SessionEntry
+    from hermes_cli.goals import GoalManager
+
+    src = _slack_thread_source()
+    adapter_key = build_session_key(src)
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(
+        platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")},
+    )
+    runner._queued_events = {}
+    session_entry = SessionEntry(
+        session_key=adapter_key,
+        session_id=f"goal-sess-{uuid.uuid4().hex[:8]}",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.SLACK,
+        chat_type="channel",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = session_entry
+    runner.session_store._generate_session_key.return_value = adapter_key
+
+    adapter = _DrainProbeAdapter()
+    runner.adapters = {Platform.SLACK: adapter}
+
+    GoalManager(session_entry.session_id).set("ship it")
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("continue", "still needs work", False, None, False),
+    ):
+        await runner._post_turn_goal_continuation(
+            session_entry=session_entry,
+            source=src,
+            final_response="partial progress",
+        )
+        await asyncio.sleep(0.05)
+
+    enqueued = adapter._pending_messages[adapter_key]
+    assert enqueued._goal_continuation_provenance is True, (
+        "goal continuation enqueued without provenance — display_kind_for_event "
+        "leaves the persisted row NULL-kind"
+    )
+    assert enqueued.internal is False, "goal continuation must stay non-internal"
+    assert display_kind_for_event(enqueued) == "internal_notification"
