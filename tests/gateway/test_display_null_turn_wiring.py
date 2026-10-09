@@ -67,3 +67,23 @@ def test_null_or_missing_display_falls_back_to_on(user_config):
 def test_memory_notifications_setting_still_applies():
     agent = _wire({"display": {"memory_notifications": "verbose"}})
     assert agent.memory_notifications == "verbose"
+
+
+@pytest.mark.parametrize(
+    ("event", "expected"),
+    [
+        pytest.param(types.SimpleNamespace(internal=True), "internal_notification", id="internal"),
+        pytest.param(types.SimpleNamespace(_heartbeat_session_id="sess-1"), "internal_notification", id="heartbeat"),
+        pytest.param(
+            types.SimpleNamespace(_goal_continuation_provenance=True),
+            "internal_notification",
+            id="goal_continuation",
+        ),
+        pytest.param(types.SimpleNamespace(), None, id="all_unset"),
+    ],
+)
+def test_display_kind_for_event_classifies_machinery(event, expected):
+    """Only self-injected machinery events classify; a plain human turn stays NULL-kind."""
+    from gateway.response_filters import display_kind_for_event
+
+    assert display_kind_for_event(event) == expected
