@@ -19,6 +19,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -52,6 +53,11 @@ _LIVE_WAIT_SECONDS = 300
 # A live owner may run a turn past one wait window, but each waiting runner holds ~46 MB and the
 # sender's notify slot: past this the runner reports pending (do not resend) and exits.
 _LIVE_WAIT_MAX_SECONDS = 30 * 60
+# A delivery turn is one-shot; bound it so a wedged child returns instead of blocking forever
+# (an orphaned runner otherwise holds the target profile's turn lock indefinitely — see the
+# 2026-10-11 frozen-DM finding). Configurable via ``bot_mode.turn_max_seconds``; the default
+# is generous enough for a long implementation reply but finite.
+_TURN_MAX_SECONDS_DEFAULT = 30 * 60
 
 # '<peer>/<agent>' — peer names are lowercase (``hermes peer`` normalizes them).
 _PEER_TARGET_RE = re.compile(r"^([a-z0-9][a-z0-9_-]{0,63})/([a-zA-Z0-9][a-zA-Z0-9_-]{0,63})$")
@@ -426,9 +432,35 @@ def _run_local_turn(argv: list[str], dm_file: str, *, env: Optional[dict[str, st
     same session; a context_overflow re-run lets the retried turn's pre-API compaction
     compact the transcript first (no fresh session is ever minted). Auth/quota/config never retry."""
 
+    def _turn_max_seconds() -> float:
+        """Bounded delivery-turn ceiling: ``bot_mode.turn_max_seconds`` else the default.
+        Read lazily so tools/ need not import CLI config at import time; a bad value falls
+        back to the default rather than disabling the bound (fail-closed)."""
+        try:
+            import hermes_cli.config as cfgmod
+            val = (cfgmod.load_config() or {}).get("bot_mode", {}).get("turn_max_seconds")
+            secs = float(val)
+            return secs if secs > 0 and math.isfinite(secs) else _TURN_MAX_SECONDS_DEFAULT
+        except Exception:
+            return _TURN_MAX_SECONDS_DEFAULT
+
     def _turn(turn_env=env):
-        return subprocess.run([*argv, "--query-file", dm_file], check=False, stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, encoding="utf-8", errors="replace", env=turn_env)
+        try:
+            return subprocess.run([*argv, "--query-file", dm_file], check=False, stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                  env=turn_env, timeout=_turn_max_seconds())
+        except subprocess.TimeoutExpired as exc:
+            # A wedged turn must not block forever (and must not leave the target profile's turn
+            # lock held by a live process). Synthesize a failed CompletedProcess so the caller's
+            # existing returncode!=0 handling runs; the child was killed by subprocess.run on
+            # timeout, which also releases the lock as the process exits.
+            def _as_text(v):
+                if v is None:
+                    return ""
+                return v.decode("utf-8", "replace") if isinstance(v, (bytes, bytearray)) else str(v)
+            return subprocess.CompletedProcess(
+                exc.cmd, 1, _as_text(exc.stdout),
+                (_as_text(exc.stderr) + f"\nhermes-delivery-timeout: turn exceeded {_turn_max_seconds():.0f}s").strip())
 
     proc = _turn()
     if proc.returncode != 0:
