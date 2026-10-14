@@ -558,6 +558,17 @@ class CLIModelSwitchMixin:
                 base_url=result.base_url or self.base_url or "",
                 api_key=result.api_key or self.api_key or "", model_info=result.model_info,
                 selection_context=selection_context_for_agent(getattr(self, "agent", None)))
+            # Honor the unattended data-training-tiers opt-in so gateway/desktop
+            # bridges (slash.exec has a 30s RPC limit) do not block on a prompt.
+            try:
+                from hermes_cli.config import load_config
+                _cfg = load_config() or {}
+                _security = _cfg.get("security", {}) if isinstance(_cfg, dict) else {}
+                if isinstance(_security, dict) and _security.get("allow_data_training_tiers_noninteractive"):
+                    if warning is not None and getattr(warning, "kind", "") == "data_policy":
+                        warning = None
+            except Exception:
+                pass
         except Exception:
             warning = None
         if warning is None:

@@ -7,6 +7,7 @@ chat_completions reasoning translations (GLM-5.2, Kimi K2, DeepSeek, Ox Alpha).
 from typing import Any
 
 from agent import reasoning_effort as re_
+from agent.gemini_native_adapter import GeminiAPIError, GeminiNativeClient
 from hermes_cli.version_info import get_version_info
 from providers import register_provider
 from providers.base import ProviderProfile
@@ -43,6 +44,31 @@ def _is_glm_5_2_model(model: str | None) -> bool:
     return any(token in m for token in ("glm-5.2", "glm-5-2", "glm-5p2"))
 
 
+class OpenCodeGoGeminiClient(GeminiNativeClient):
+    """Gemini native transport over OpenCode Go's inference endpoint (Bearer auth)."""
+
+    def __init__(self, *, base_url: Any = None, default_headers: Any = None, **kwargs: Any) -> None:
+        merged_headers = dict(default_headers or {})
+        # OpenCode Go requires a stable session id and a client-identifying header on
+        # every request; merge after the caller's headers so caller-pinned values win.
+        try:
+            from agent.opencode_affinity import opencode_session_headers
+
+            session_headers = opencode_session_headers("opencode-go", str(base_url or ""))
+            for key, value in session_headers.items():
+                merged_headers.setdefault(key, value)
+        except Exception:
+            pass
+        effective_base = base_url or "https://opencode.ai/inference/go/v1"
+        super().__init__(base_url=effective_base, default_headers=merged_headers, **kwargs)
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self.api_key}"}
+
+    def _http_error(self, response: Any, body_text: Any = None) -> GeminiAPIError:
+        from agent.gemini_native_adapter import gemini_http_error
+
+        return gemini_http_error(response, body_text=body_text, base_url=self.base_url, key_guidance=False)
 class OpenCodeGoProfile(ProviderProfile):
     """OpenCode Go - model-specific reasoning controls."""
 
@@ -53,6 +79,37 @@ class OpenCodeGoProfile(ProviderProfile):
     def get_max_tokens(self, model: str | None) -> int | None:
         cap = self._MODEL_MAX_TOKENS.get(_flat_model_name(model))
         return self.default_max_tokens if cap is None else cap
+
+    def create_client(self, **client_kwargs: Any) -> Any:
+        model = str(client_kwargs.pop("model", "") or "").strip().lower()
+        base_url = str(client_kwargs.get("base_url") or "").strip()
+        if not str(client_kwargs.get("api_key") or "").strip():
+            return None
+        is_gemini = model.startswith("gemini") or "/inference/" in base_url.lower()
+        if not is_gemini:
+            return None
+        effective_base = base_url if ("/inference/" in base_url.lower() and "opencode.ai" in base_url.lower()) else "https://opencode.ai/inference/go/v1"
+        # Keep both caller and profile headers, then add OpenCode session affinity.
+        merged_headers = dict(self.default_headers or {})
+        existing_headers = client_kwargs.get("default_headers")
+        if isinstance(existing_headers, dict):
+            merged_headers.update(existing_headers)
+        try:
+            from agent.opencode_affinity import opencode_session_headers
+
+            for key, value in opencode_session_headers("opencode-go", effective_base).items():
+                merged_headers.setdefault(key, value)
+        except Exception:
+            pass
+        kwargs = {k: v for k, v in client_kwargs.items() if k not in {"default_headers", "model", "api_key", "base_url", "timeout", "http_client"}}
+        return OpenCodeGoGeminiClient(
+            api_key=client_kwargs.get("api_key", ""),
+            base_url=effective_base,
+            default_headers=merged_headers,
+            timeout=client_kwargs.get("timeout"),
+            http_client=client_kwargs.get("http_client"),
+            **kwargs,
+        )
 
     def fetch_account_usage(self, *, base_url: str | None = None, api_key: str | None = None):
         """Go subscription windows for /usage via ``/zen/go/v1/usage`` (anomalyco/opencode#16513).

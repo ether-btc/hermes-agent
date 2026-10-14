@@ -5307,7 +5307,7 @@ def _resolve_api_key_branch(req: _ResolveRequest, pconfig: Any, resolve_creds: C
         base_url = _to_openai_base_url(req.explicit_base_url.strip().rstrip("/"))
     final_model = _normalize_resolved_model(req.model or _get_aux_model_for_provider(provider), provider)
     # Consulted before the built-in gemini/OpenAI ladder so a registered native transport wins (#112384).
-    profile_client = _api_key_profile_supplied_client(provider, api_key=api_key, base_url=base_url)
+    profile_client = _api_key_profile_supplied_client(provider, api_key=api_key, base_url=base_url, model=final_model)
     if profile_client is not None:
         logger.debug("resolve_provider_client: %s native client from provider profile (%s)", provider, final_model)
         return _route_client(req, profile_client, final_model)
