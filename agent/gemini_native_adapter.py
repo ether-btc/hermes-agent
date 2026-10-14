@@ -158,7 +158,14 @@ def is_native_gemini_base_url(base_url: str) -> bool:
     normalized = str(base_url or "").strip().rstrip("/").lower()
     if normalized.endswith("/openai"):
         return False
-    return "generativelanguage.googleapis.com" in normalized or is_vertex_express_base_url(normalized)
+    if "generativelanguage.googleapis.com" in normalized or is_vertex_express_base_url(normalized):
+        return True
+    # OpenCode Go serves Gemini models through an inference endpoint that speaks
+    # the native Google generateContent protocol (Bearer auth; base URL like
+    # https://opencode.ai/inference/go/v1). Recognize by host + path so session
+    # compaction/max-token logic treats it as native without forcing the standard
+    # Gemini host.
+    return "opencode.ai" in normalized and "/inference/" in normalized
 
 
 def gemini_accepts_parameters_json_schema(base_url: str) -> bool:

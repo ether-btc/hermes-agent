@@ -255,7 +255,8 @@ _GIST_TEMPLATES = {"write_file": "write {file_path} in '{name}'", "remove_file":
 
 
 def skill_gist(action: str, name: str, *, content: str = "", file_path: str = "",
-               old_string: str = "", new_string: str = "") -> str:
+               old_string: str = "", new_string: str = "", evidence_merge: Dict[str, Any] = None,
+               evidence_source_digest: str = "") -> str:
     """One-line heuristic gist (no model call) for a pending skill write: create/edit use
     the frontmatter ``description:``; patch/write_file describe the size of the change."""
     if action in {"create", "edit"} and content:
@@ -263,6 +264,14 @@ def skill_gist(action: str, name: str, *, content: str = "", file_path: str = ""
         size = f"{len(content) // 1024 + 1} KB" if len(content) >= 1024 else f"{len(content)} chars"
         return f"{'create' if action == 'create' else 'rewrite'} '{name}'{f' — {desc}' if desc else ''} ({size})"
     if action == "patch":
+        if evidence_merge is not None:
+            steps = evidence_merge.get("steps", [])
+            evolution = evidence_merge.get("evolution", [])
+            head = (f"merge {len(steps)} new step(s) and {len(evolution)} evolution entry(ies) "
+                    f"into '{name}'")
+            if evidence_source_digest:
+                head += f" (sha256={evidence_source_digest[:12]})"
+            return head
         removed = old_string.count("\n") + 1 if old_string else 0
         added = new_string.count("\n") + 1 if new_string else 0
         return f"patch '{name}' {file_path or 'SKILL.md'} (+{added}/-{removed} lines)"
@@ -326,17 +335,23 @@ def skill_pending_diff(
     current = _staged_base(name, target_label, staged)
 
     if action == "patch":
-        old_s, new_s = payload.get("old_string") or "", payload.get("new_string") or ""
-        if not current:
-            new = f"(patch {old_s!r} → {new_s!r})"
+        if payload.get("evidence_merge") is not None:
+            # The staged record carries the merged candidate that the reviewer saw;
+            # diff it against the current SKILL.md so the pending view shows exactly
+            # what approval commits.
+            new = payload.get("evidence_candidate") or "(merged candidate not available)"
         else:
-            # Fold through the same matcher approve will run, so the preview can't
-            # fabricate a result the approve path would reject (repeated anchor without
-            # replace_all, whitespace-only anchor, escape drift, old_string == new_string).
-            folded, patch_err = _fold_patch(current, old_s, new_s, payload.get("replace_all"))
-            if patch_err:
-                return f"(patch would fail: {patch_err})"
-            new = folded
+            old_s, new_s = payload.get("old_string") or "", payload.get("new_string") or ""
+            if not current:
+                new = f"(patch {old_s!r} → {new_s!r})"
+            else:
+                # Fold through the same matcher approve will run, so the preview can't
+                # fabricate a result the approve path would reject (repeated anchor without
+                # replace_all, whitespace-only anchor, escape drift, old_string == new_string).
+                folded, patch_err = _fold_patch(current, old_s, new_s, payload.get("replace_all"))
+                if patch_err:
+                    return f"(patch would fail: {patch_err})"
+                new = folded
     else:
         new = payload.get("content" if action == "edit" else "file_content") or ""
     diff = difflib.unified_diff(current.splitlines(keepends=True), new.splitlines(keepends=True),

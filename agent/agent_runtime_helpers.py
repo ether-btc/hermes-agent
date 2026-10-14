@@ -1913,7 +1913,9 @@ def _provider_supplied_client(agent, client_kwargs: dict) -> Any | None:
     if profile is None:
         return None
     try:
-        return profile.create_client(**client_kwargs)
+        _client_kwargs = dict(client_kwargs or {})
+        _client_kwargs.setdefault("model", getattr(agent, "model", None))
+        return profile.create_client(**_client_kwargs)
     except Exception:
         _ra().logger.warning(
             "Provider profile %r failed to create a client; falling back to the standard client path",
