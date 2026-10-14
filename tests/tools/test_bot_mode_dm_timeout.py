@@ -141,3 +141,40 @@ def test_run_local_turn_zero_config_uses_default(tmp_path, capsys, monkeypatch):
 
     assert rc == 0, f"Expected rc=0, got {rc}: stderr={captured.err}"
     assert "sleeper done" in captured.out
+
+
+def test_run_local_turn_non_finite_config_falls_back_to_default(tmp_path, capsys, monkeypatch):
+    """
+    A non-finite config value (.inf / .nan) falls back to the default bound.
+    Monkeypatch the default to a SMALL value so the bound is observable:
+    a sleeper longer than the patched default MUST be killed iff the fallback occurred.
+    """
+    import tools.bot_mode_dm as bmd
+
+    # Patch the module-level default to a SMALL observable value (0.3s)
+    monkeypatch.setattr(bmd, "_TURN_MAX_SECONDS_DEFAULT", 0.3)
+
+    dm_file = tmp_path / "dm.txt"
+    dm_file.write_text("test message", encoding="utf-8")
+
+    # Sleeper exceeds the patched default (0.3s) — must be killed if fallback happened
+    sleeper = _make_sleeper_script(2.0, tmp_path)
+
+    home = tmp_path / "hermes-home"
+    # Test both .inf and .nan as non-finite values
+    for non_finite in (".inf", ".nan"):
+        _write_config(home, f"bot_mode:\n  turn_max_seconds: {non_finite}\n")
+
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        argv = [sys.executable, str(sleeper)]
+        rc = _run_local_turn(argv, str(dm_file), env=os.environ.copy())
+
+        captured = capsys.readouterr()
+
+        # Child must be killed by the fallback bound
+        assert rc != 0, f"Expected non-zero rc for {non_finite}, got {rc}: stderr={captured.err}"
+        # Exact timeout marker from production code (line 463 in bot_mode_dm.py)
+        assert "hermes-delivery-timeout: turn exceeded 0s" in captured.err, (
+            f"Missing timeout marker for {non_finite}: stderr={captured.err}"
+        )
