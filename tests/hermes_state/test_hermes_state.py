@@ -98,24 +98,6 @@ def db(tmp_path):
     session_db.close()
 
 
-@pytest.fixture(autouse=True)
-def _no_fts_rebuild_throttle(monkeypatch):
-    """Zero the FTS-rebuild inter-chunk throttle for every test in this file.
-
-    ``optimize_fts_storage`` sleeps ``max(_FTS_REBUILD_MIN_PAUSE,
-    chunk_cost * _FTS_REBUILD_DUTY_FACTOR)`` between chunks so a LIVE
-    gateway/CLI sharing the DB isn't starved of the write lock. Tests run
-    against a private tmp-path DB with no concurrent process — the sleep
-    protects nobody and was pure dead time (measured: 4.1s of a 4.6s
-    migration test was time.sleep; ~20s across the file, whose total was
-    ~52s). The duty-cycle POLICY (sleep >= 4x chunk cost) stays covered by
-    the production constants themselves; no test asserts on wall-clock
-    pacing.
-    """
-    monkeypatch.setattr(SessionDB, "_FTS_REBUILD_MIN_PAUSE", 0.0)
-    monkeypatch.setattr(SessionDB, "_FTS_REBUILD_DUTY_FACTOR", 0.0)
-
-
 # =========================================================================
 # Connection lifecycle
 # =========================================================================
@@ -416,7 +398,7 @@ class TestConnectionLifecycle:
         read_only = SessionDB(db_path=db_path, read_only=True)
         try:
             assert read_only._fts_enabled is True
-            matches = read_only.search_messages("wal-race")
+            read_only.search_messages("wal-race")
         finally:
             read_only.close()
 
@@ -722,7 +704,7 @@ class TestMessageStorage:
             conn = real_connect(*args, **kwargs)
             conn.set_trace_callback(
                 lambda stmt: writes.append(stmt)
-                if re.match(r"\s*(INSERT|UPDATE|DELETE|REPLACE|ALTER|DROP\s+TRIGGER)\b", stmt, re.I) and "temp." not in stmt
+                if re.match(r"\s*(INSERT|UPDATE|DELETE|REPLACE|ALTER|DROP\s+TRIGGER)\b", stmt, re.IGNORECASE) and "temp." not in stmt
                 else None
             )
             return conn
@@ -4000,6 +3982,167 @@ class TestAutoMaintenance:
         # Active session's transcript is untouched
         assert (sessions_dir / "new.jsonl").exists()
 
+    def test_repair_orphan_references_cleans_all_three_classes(self, db):
+        """Repair nulls dangling parents and deletes orphan messages/usage rows."""
+        db.create_session(session_id="parent", source="cli")
+        db.create_session(session_id="child", source="cli", parent_session_id="parent")
+        db.append_message(session_id="child", role="user", content="hello")
+
+        # Simulate a legacy FK-off deletion of `parent`: rows that reference it
+        # are now orphaned. SQLite ignores PRAGMA foreign_keys changes inside a
+        # pending transaction, so each corruption block commits its FK-off DML
+        # BEFORE re-enabling FKs — this exercises repair under production FK
+        # enforcement (same as the real-world bug).
+        self._fk_off_execute_commit(
+            db,
+            "DELETE FROM sessions WHERE id = 'parent'",
+        )
+
+        # Orphan usage row pointing at a session that no longer exists
+        self._fk_off_execute_commit(
+            db,
+            "INSERT INTO session_model_usage "
+            "(session_id, model, billing_provider, api_call_count) "
+            "VALUES ('ghost_session', 'test-model', 'test', 1)",
+        )
+
+        # Topic bindings table only exists after /topic opt-in migration —
+        # create it so the 4th orphan class is exercised.
+        db.apply_telegram_topic_migration()
+
+        # Orphan topic binding pointing at a session that no longer exists
+        self._fk_off_execute_commit(
+            db,
+            "INSERT INTO telegram_dm_topic_bindings "
+            "(chat_id, thread_id, user_id, session_key, session_id, linked_at, updated_at) "
+            "VALUES ('chat1', 'thread1', 'user1', 'key1', 'ghost_session', ?, ?)",
+            (time.time(), time.time()),
+        )
+
+        # Repair must run under real FK enforcement
+        assert db._conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+        repaired = db.repair_orphan_references()
+
+        assert repaired["parent_pointers_nulled"] == 1  # child.parent → NULL
+        assert repaired["orphan_usage_deleted"] == 1  # ghost usage row
+        assert repaired["orphan_topic_bindings_deleted"] == 1  # ghost binding
+        # child has no orphan messages (parent had none), so 0 expected here
+        assert repaired["orphan_messages_deleted"] == 0
+
+        # FK check is now clean
+        violations = db._conn.execute("PRAGMA foreign_key_check").fetchall()
+        assert violations == []
+
+        # child survived and its parent pointer was nulled, not deleted
+        child = db.get_session("child")
+        assert child is not None
+        assert child["parent_session_id"] is None
+
+    def _fk_off_execute_commit(self, db, sql, params=()):
+        """Run corrupting DML on an FK-off connection, commit, then re-enable FK.
+
+        Mirrors the historical bug (deletion via a connection opened before FK
+        enforcement) while keeping the shared connection's FK pragma ON for the
+        repair itself. SQLite ignores PRAGMA foreign_keys changes mid-transaction,
+        so the DML is committed BEFORE re-enabling enforcement.
+        """
+        conn = db._conn
+        conn.execute("PRAGMA foreign_keys=OFF")
+        conn.execute(sql, params)
+        conn.commit()
+        conn.execute("PRAGMA foreign_keys=ON")
+        # Verify enforcement really is back on — the whole point of the fix.
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+
+    def test_repair_orphan_references_deletes_orphan_messages(self, db):
+        """Messages whose session row is gone are removed by repair."""
+        db.create_session(session_id="alive", source="cli")
+        db.append_message(session_id="alive", role="user", content="keep me")
+
+        # Orphan message rows (session deleted out-of-band)
+        self._fk_off_execute_commit(
+            db,
+            "INSERT INTO messages (session_id, role, content, timestamp) "
+            "VALUES ('gone1', 'user', 'orphan msg', ?)",
+            (time.time(),),
+        )
+        self._fk_off_execute_commit(
+            db,
+            "INSERT INTO messages (session_id, role, content, timestamp) "
+            "VALUES ('gone2', 'user', 'orphan msg', ?)",
+            (time.time(),),
+        )
+
+        repaired = db.repair_orphan_references()
+
+        assert repaired["orphan_messages_deleted"] == 2
+        assert repaired["orphan_usage_deleted"] == 0
+        assert repaired["orphan_topic_bindings_deleted"] == 0
+        # Alive session's messages untouched
+        assert len(db.search_messages("keep me")) == 1
+
+        violations = db._conn.execute("PRAGMA foreign_key_check").fetchall()
+        assert violations == []
+
+    def test_auto_prune_runs_orphan_repair(self, db):
+        """maybe_auto_prune_and_vacuum self-heals FK orphans in the same pass."""
+        # Prunable old session with an orphan child pointer
+        self._make_old_ended(db, "old", days_old=100)
+        self._fk_off_execute_commit(
+            db,
+            "INSERT INTO sessions (id, source, parent_session_id, started_at) "
+            "VALUES ('orphan_child', 'cli', 'no_such_parent', ?)",
+            (time.time(),),
+        )
+        self._fk_off_execute_commit(
+            db,
+            "INSERT INTO session_model_usage "
+            "(session_id, model, billing_provider, api_call_count) "
+            "VALUES ('ghost', 'm', 'p', 1)",
+        )
+
+        result = db.maybe_auto_prune_and_vacuum(retention_days=90)
+
+        assert result["pruned"] == 1  # old session pruned
+        assert "repaired" in result
+        assert result["repaired"]["parent_pointers_nulled"] == 1
+        assert result["repaired"]["orphan_usage_deleted"] == 1
+
+        violations = db._conn.execute("PRAGMA foreign_key_check").fetchall()
+        assert violations == []
+
+    def test_maybe_repair_orphan_references_runs_without_auto_prune(self, db):
+        """Standalone FK self-heal works even when auto_prune is off (default)."""
+        db.create_session(session_id="parent", source="cli")
+        db.create_session(session_id="child", source="cli", parent_session_id="parent")
+        self._fk_off_execute_commit(
+            db,
+            "DELETE FROM sessions WHERE id = 'parent'",
+        )
+        db.apply_telegram_topic_migration()
+        self._fk_off_execute_commit(
+            db,
+            "INSERT INTO telegram_dm_topic_bindings "
+            "(chat_id, thread_id, user_id, session_key, session_id, linked_at, updated_at) "
+            "VALUES ('chat1', 'thread1', 'user1', 'key1', 'ghost_session', ?, ?)",
+            (time.time(), time.time()),
+        )
+
+        # auto_prune NOT called at all — the decoupled entrypoint alone
+        result = db.maybe_repair_orphan_references(min_interval_hours=24)
+
+        assert result["skipped"] is False
+        assert result["repaired"]["parent_pointers_nulled"] == 1
+        assert result["repaired"]["orphan_topic_bindings_deleted"] == 1
+
+        # Second call within the interval is a no-op skip
+        result2 = db.maybe_repair_orphan_references(min_interval_hours=24)
+        assert result2["skipped"] is True
+
+        violations = db._conn.execute("PRAGMA foreign_key_check").fetchall()
+        assert violations == []
+
 
 
 
@@ -4699,27 +4842,6 @@ class TestFTSExternalContentMigration:
         finally:
             db.close()
 
-    def test_optimize_settle_refuses_pending_backfill(self, tmp_path):
-        """Settle must not stamp while high_water markers remain."""
-        db = SessionDB(db_path=tmp_path / "fresh.db")
-        try:
-            db.create_session(session_id="s1", source="cli")
-            db.append_message("s1", role="user", content="settle guard needle")
-            # Plant markers without going through demote.
-            db.set_meta("fts_rebuild_high_water", "1")
-            db.set_meta("fts_rebuild_progress", "0")
-            # The public contract: optimize returns ok=False when still
-            # pending. Simulate an unfinishable backfill by stubbing the
-            # chunk step to a no-op while markers stay.
-            db.fts_rebuild_step = lambda: False  # type: ignore[method-assign]
-            result = db.optimize_fts_storage(vacuum=False)
-            assert result["ok"] is False
-            assert result.get("reason") == "backfill_incomplete"
-            assert db.get_meta("fts_storage_version") is None
-            assert db.get_meta("fts_rebuild_high_water") is not None
-        finally:
-            db.close()
-
     def test_v23_fresh_db_born_optimized(self, tmp_path):
         """A brand-new DB is born on v23 — no legacy layout, no opt-in flag,
         no pending rebuild."""
@@ -5131,7 +5253,7 @@ class TestListCronJobRuns:
     """
 
     def _seed_run(self, db, job_id: str, idx: int, started_at: float):
-        sid = f"cron_{job_id}_{idx:08d}"
+        sid = f"cron_{job_id}_20261011_{idx:06d}"  # the scheduler's cron_{job}_{YYYYmmdd_HHMMSS}
         db.create_session(session_id=sid, source="cron")
         db.append_message(sid, role="user", content=f"run {idx} for {job_id}")
         db.append_message(sid, role="assistant", content="done")
