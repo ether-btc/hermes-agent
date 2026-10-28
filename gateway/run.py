@@ -3516,7 +3516,33 @@ class GatewayRunner(
                 # Store handle unavailable: opening our own would resurrect the duplicate borrowed away.
                 raise RuntimeError("SessionStore SQLite handle unavailable")
             try:
-                return AsyncSessionDB(acquire())
+                db = acquire()
+                from hermes_cli.config import load_config as _load_full_config
+                _sess_cfg = (_load_full_config().get("sessions") or {})
+                # Non-destructive stale-session archive, independent of prune.
+                if _sess_cfg.get("auto_archive", False):
+                    db.maybe_auto_archive(
+                        idle_days=float(_sess_cfg.get("auto_archive_days", 3)),
+                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                    )
+                # FK integrity self-heal is independent of the destructive
+                # auto_prune sweep — default installs (auto_prune off) still
+                # self-heal. Own min_interval gate in state_meta; never raises.
+                db.maybe_repair_orphan_references(
+                    min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                )
+                if _sess_cfg.get("auto_prune", False):
+                    # Construction-time, before the loop serves traffic; sync DB is fine.
+                    db.maybe_auto_prune_and_vacuum(
+                        retention_days=int(_sess_cfg.get("retention_days", 90)),
+                        min_interval_hours=int(_sess_cfg.get("min_interval_hours", 24)),
+                        min_vacuum_interval_days=int(
+                            _sess_cfg.get("min_vacuum_interval_days", 30)
+                        ),
+                        vacuum=bool(_sess_cfg.get("vacuum_after_prune", True)),
+                        sessions_dir=self.config.sessions_dir,
+                    )
+                return AsyncSessionDB(db)
             except Exception as exc:
                 logger.warning("SQLite session store not available: %s", exc)
                 raise
