@@ -88,7 +88,26 @@ run_source_installer() {
       || { fail "ref $ref does not support --include-desktop; this leg cannot mean what it claims"; return 1; }
     flags+=(--include-desktop)
   fi
-  bash "$script" "${flags[@]}" < /dev/null 2>&1 | ts_prefix > "$logs/install-$label.log" || rc=$?
+  # Installers that predate the --skip-browser flag cannot opt the browser
+  # download out by flag, and PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD is inert for
+  # the CLI `install` command (measured on this host against 1.59.1: the
+  # download proceeds anyway; it only gates the npm postinstall). So pin the
+  # intent through the download host instead: mid-November 2026 the runners'
+  # path to the pinned Chrome-for-Testing build began delivering the full
+  # 170 MiB (progress bar reaches its own 100%) and then never closes the
+  # stream, so the released v2026.5.7 `npx playwright install --with-deps
+  # chromium` waits forever and the leg dies at the 60-minute timeout -
+  # issue #10, runs 78-88, every scheduled run since. A dead download host
+  # converts the unbounded stall into the BOUNDED failure the released
+  # installer already handles: `|| { log_warn ... }` warns and continues.
+  # That outcome is proven-acceptable: run 43046340161 (Nov 11) shipped a
+  # GREEN v5.7 leg whose browser install had FAILED outright (apt could not
+  # resolve its mirrors, exit 100, browsers never installed) - no leg
+  # assertion drives the OLD-ref browser; HEAD's own browser arrives via PM
+  # after the update. Pre-PM refs only; PM-era legs keep a pristine net.
+  local browser_dl_env=()
+  grep -qF 'pm.cli' <<< "$text" || browser_dl_env=(PLAYWRIGHT_DOWNLOAD_HOST=http://127.0.0.1:1)
+  env ${browser_dl_env[@]+"${browser_dl_env[@]}"} bash "$script" "${flags[@]}" < /dev/null 2>&1 | ts_prefix > "$logs/install-$label.log" || rc=$?
   log_group "install.sh ($label) transcript" "$logs/install-$label.log"
   [ "$rc" -eq 0 ] || { fail "install.sh ($label) exited $rc; log at $logs/install-$label.log"; return "$rc"; }
 }
