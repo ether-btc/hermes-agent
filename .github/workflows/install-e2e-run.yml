@@ -124,6 +124,46 @@ jobs:
           mode: start
           output: ${{ runner.temp }}/e2e-logs/recording.mkv
 
+      # TEMPORARY diagnostic (see issue on this repo): the two v2026.5.7 legs of
+      # scheduled runs 74-88 hang inside OLD's released
+      # `npx playwright install --with-deps chromium` until the 60-minute job
+      # timeout, and the released installer swallows the prompt's stderr
+      # (2>/dev/null), so nothing names the blocked process. This watcher records
+      # the actual tree — leaf cmdlines, wchan, tty fds, dpkg-lock holder — once
+      # per 45s into the artifact dir the leg already uploads. Remove after the
+      # fix lands; a passing leg pays one process and ~2 KB of log.
+      - name: Start proctree hang probe (diagnostic)
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/e2e-logs"
+          nohup bash -c '
+            probe="$RUNNER_TEMP/e2e-logs/proctree.log"
+            deadline=$(( $(date +%s) + 3300 ))
+            while [ "$(date +%s)" -lt "$deadline" ]; do
+              {
+                echo "=== $(date -u +%FT%TZ) ==="
+                ps -eo pid,ppid,stat,etimes,wchan:20,args | grep -E "playwright|needrestart|apt-get|dpkg|whiptail|dialog" | grep -v grep || echo "(no interesting processes)"
+                fuser -v /var/lib/dpkg/lock-frontend 2>&1 || true
+                for p in $(pgrep -f "npm exec playwright" 2>/dev/null); do
+                  echo "--- playwright pid $p: tty fds:"
+                  sudo ls -l /proc/$p/fd 2>/dev/null | grep -i tty || echo "    (none)"
+                  echo "--- descendants:"
+                  for c in $(pgrep -P "$p" 2>/dev/null); do
+                    echo "  child $p/$c wchan=$(cat /proc/$c/wchan 2>/dev/null) cmd=$(tr "\0" " " < /proc/$c/cmdline 2>/dev/null)"
+                    for g in $(pgrep -P "$c" 2>/dev/null); do
+                      echo "    gchild $c/$g wchan=$(cat /proc/$g/wchan 2>/dev/null) cmd=$(tr "\0" " " < /proc/$g/cmdline 2>/dev/null)"
+                      for gg in $(pgrep -P "$g" 2>/dev/null); do
+                        echo "      ggchild $g/$gg wchan=$(cat /proc/$gg/wchan 2>/dev/null) cmd=$(tr "\0" " " < /proc/$gg/cmdline 2>/dev/null)"
+                      done
+                    done
+                  done
+                done
+              } >> "$probe" 2>&1
+              sleep 45
+            done
+          ' >/dev/null 2>&1 &
+          echo "proctree probe started (pid $!)"
+
       - name: Run install + update E2E
         run: |
           set -euo pipefail
