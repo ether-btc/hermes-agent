@@ -338,6 +338,12 @@ jobs:
       # to block a merge. A separate run also stops it from holding this
       # run open. That is what blocked ``gh run rerun``.
     if: always()
+    # `actions: read` is for the gate's read-only evidence lookups (the unallocated
+    # runner check); a job-level permissions block replaces the workflow-level one,
+    # so `contents: read` stays required for the checkout above.
+    permissions:
+      contents: read
+      actions: read
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -351,12 +357,22 @@ jobs:
         # Shared with the stable orchestrator (scripts/ci/required_results.py
         # is imported there). NEEDS is the toJSON(needs) context; RELEASE
         # switches the gate into strict mode for release runs.
+        # --allow-unallocated (non-release): a cancelled job may mean it never ran at
+        # all. On a plan that cannot allocate a pinned larger-runner label, GitHub
+        # holds the job for its 24 h queue maximum and cancels it with no steps and no
+        # runner. The gate then passes only when this run's API evidence says every
+        # cancelled job never executed on a known unallocatable label, at least one job
+        # did allocate, the job list was read completely, and detect succeeded. Any
+        # error, truncation or ambiguity keeps the failure.
         env:
           NEEDS: ${{ toJSON(needs) }}
           RELEASE: ${{ inputs.release }}
+          # Read-only Actions API access for the evidence lookup. GH_TOKEN is the name
+          # the script prefers, so the runner's reserved GITHUB_* variables stay untouched.
+          GH_TOKEN: ${{ github.token }}
         run: |
           args=()
-          if [ "$RELEASE" = true ]; then args+=(--release); fi
+          if [ "$RELEASE" = true ]; then args+=(--release); else args+=(--allow-unallocated); fi
           printf '%s' "$NEEDS" | python3 scripts/ci/required_results.py "${args[@]}"
 
   # ─────────────────────────────────────────────────────────────────────
