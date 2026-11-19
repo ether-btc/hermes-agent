@@ -33,7 +33,8 @@ def test_status_policy(job, result, ordinary, excluded, release):
         expected = True
     verdict = evaluate_gate({job: {} if result is None else {"result": result}}, release=release)
     assert verdict == {"ok": expected, "failed": [] if expected else [job],
-                       "allowed_skips": [job] if expected and result == "skipped" else []}
+                       "allowed_skips": [job] if expected and result == "skipped" else [],
+                       "unallocated": []}
 
 
 @pytest.mark.parametrize("lane,jobs", [
@@ -69,7 +70,7 @@ def test_release_exclusion_policy():
 @pytest.mark.parametrize("release", [False, True])
 def test_empty_needs_fails_closed(needs, release):
     assert evaluate_gate(needs, release=release) == {
-        "ok": False, "failed": ["<no-needs>"], "allowed_skips": [],
+        "ok": False, "failed": ["<no-needs>"], "allowed_skips": [], "unallocated": [],
     }
     assert required_results.compact_results(needs) == {}
 
@@ -326,3 +327,228 @@ def test_release_rejects_allow_superseded(monkeypatch, capsys):
         _run_main(monkeypatch, capsys, _CANCELLED_DETECT, ["--release", "--allow-superseded"],
                   lambda path: None)
     assert exc.value.code == 2
+
+
+# ── --allow-unallocated: "never ran" is not "failed" ──────────────────────────
+# Measured 2026-11-19: five lanes pin GitHub larger hosted runners this account
+# cannot allocate, so GitHub queues them for its 24 h maximum and cancels them with
+# steps == [] and runner_name == "". Such a job never executed; the aggregate gate
+# must be able to say so without pretending it passed.
+
+_UNALLOC_NEEDS = {
+    "detect": {"result": "success", "outputs": {}},
+    "tests": {"result": "cancelled"},
+    "tests-os": {"result": "cancelled"},
+    "lint": {"result": "success"},
+}
+
+
+def _job(conclusion="cancelled", *, runner="", steps=(), labels=("ubuntu-latest-32-core",)):
+    return {"name": "job", "conclusion": conclusion, "runner_name": runner,
+            "steps": list(steps), "labels": list(labels)}
+
+
+def _jobs_fetch(jobs, total=None):
+    """Serve repos/o/r/actions/runs/1/jobs?per_page=100&page=N like GitHub."""
+    calls = []
+
+    def fetch(path):
+        calls.append(path)
+        if not path.startswith("repos/o/r/actions/runs/1/jobs"):
+            raise AssertionError(f"unexpected API call {path}")
+        params = dict(urllib.parse.parse_qsl(path.partition("?")[2]))
+        size, page = int(params["per_page"]), int(params["page"])
+        return {"total_count": len(jobs) if total is None else total,
+                "jobs": jobs[(page - 1) * size:page * size]}
+    return fetch, calls
+
+
+def _allocated_jobs(cancelled=2, executed=2, **over):
+    """A run that allocated work and also had unallocatable cancels."""
+    jobs = [_job(conclusion="success", runner="GitHub Actions 1", steps=[{"name": "run"}],
+                 labels=("ubuntu-latest",)) for _ in range(executed)]
+    jobs += [_job(**over) for _ in range(cancelled)]
+    return jobs
+
+
+def _run_unalloc(monkeypatch, capsys, needs, fetch, argv=("--allow-unallocated",)):
+    code, out = _run_main(monkeypatch, capsys, needs, list(argv), fetch)
+    return code, out
+
+
+def test_t1_unallocated_cancels_are_non_blocking_with_evidence(monkeypatch, capsys):
+    fetch, calls = _jobs_fetch(_allocated_jobs())
+    code, out = _run_unalloc(monkeypatch, capsys, _UNALLOC_NEEDS, fetch)
+    assert code == 0, out
+    assert "::warning::Unallocated jobs (no runner assigned, non-blocking): tests, tests-os" in out
+    assert "🕳️ tests: unallocated (no runner assigned) — non-blocking" in out
+    assert "::error::" not in out
+    assert len(calls) == 1
+
+
+def test_t1b_negative_control_without_the_flag_still_fails(monkeypatch, capsys):
+    # The same input and the same evidence, but no flag: the gate must stay red.
+    fetch, calls = _jobs_fetch(_allocated_jobs())
+    code, out = _run_unalloc(monkeypatch, capsys, _UNALLOC_NEEDS, fetch, argv=())
+    assert code == 1
+    assert "::error::2 job(s) failed: tests, tests-os" in out
+    assert calls == []
+
+
+def test_t2_release_refuses_the_flag(monkeypatch, capsys):
+    with pytest.raises(SystemExit) as exc:
+        _run_unalloc(monkeypatch, capsys, _UNALLOC_NEEDS, lambda path: None,
+                     argv=("--release", "--allow-unallocated"))
+    assert exc.value.code == 2
+
+
+def test_t3_required_consumer_never_waived(monkeypatch, capsys):
+    # detect selects the python lane: tests/tests-os must have executed. No API call at all.
+    needs = {**_UNALLOC_NEEDS, "detect": {"result": "success", "outputs": {"python": "true"}}}
+    code, out = _run_unalloc(monkeypatch, capsys, needs, lambda path: _raise(path))
+    assert code == 1
+    assert "::error::" in out
+
+
+def _raise(path):
+    raise AssertionError(f"unexpected API call {path}")
+
+
+def test_t4_real_failures_never_consult_the_api(monkeypatch, capsys):
+    needs = {**_UNALLOC_NEEDS, "tests": {"result": "failure"}}
+    code, out = _run_unalloc(monkeypatch, capsys, needs, _raise)
+    assert code == 1
+    assert "::error::2 job(s) failed: tests, tests-os" in out
+
+
+@pytest.mark.parametrize("fetch", [
+    lambda path: (_ for _ in ()).throw(OSError("api down")),
+    lambda path: None,
+    lambda path: [],
+    lambda path: {"total_count": 4},              # jobs key missing
+    lambda path: {"total_count": 99, "jobs": []},  # nothing read, count disagrees
+])
+def test_t5_lookup_faults_fail_closed(monkeypatch, capsys, fetch):
+    code, out = _run_unalloc(monkeypatch, capsys, _UNALLOC_NEEDS, fetch)
+    assert code == 1
+    assert "keeping the failure" in out or "Not downgrading" in out
+    assert "::error::" in out
+
+
+def test_t6_one_executed_cancel_blocks_the_whole_downgrade(monkeypatch, capsys):
+    jobs = _allocated_jobs() + [_job(runner="GitHub Actions 9", steps=[{"name": "run"}])]
+    fetch, _ = _jobs_fetch(jobs)
+    code, out = _run_unalloc(monkeypatch, capsys, _UNALLOC_NEEDS, fetch)
+    assert code == 1
+    assert "Not downgrading to unallocated" in out
+    assert "::error::" in out
+
+
+def test_t10_zero_execution_run_is_not_waived(monkeypatch, capsys):
+    # A run cancelled before anything allocated: every job is a zero-step cancel, so
+    # "all cancelled jobs are unallocated" is trivially true. It must still fail.
+    jobs = [_job() for _ in range(4)]
+    fetch, _ = _jobs_fetch(jobs)
+    code, out = _run_unalloc(monkeypatch, capsys, _UNALLOC_NEEDS, fetch)
+    assert code == 1
+    assert "executed=0" in out
+    assert "::error::" in out
+
+
+def test_t11_incomplete_job_list_is_not_evidence(monkeypatch, capsys):
+    fetch, _ = _jobs_fetch(_allocated_jobs(), total=99)
+    code, out = _run_unalloc(monkeypatch, capsys, _UNALLOC_NEEDS, fetch)
+    assert code == 1
+    assert "truncated=True" in out
+
+
+def test_t12_label_outside_the_pinned_set_blocks_the_downgrade(monkeypatch, capsys):
+    # The macos leg cancelled on a standard, allocatable label: re-runnable, so fatal.
+    fetch, _ = _jobs_fetch(_allocated_jobs(labels=("macos-latest",)))
+    code, out = _run_unalloc(monkeypatch, capsys, _UNALLOC_NEEDS, fetch)
+    assert code == 1
+    assert "labels_ok=False" in out
+
+
+def test_t13_extra_labels_block_the_downgrade(monkeypatch, capsys):
+    fetch, _ = _jobs_fetch(_allocated_jobs(labels=("self-hosted", "ubuntu-latest-32-core")))
+    code, _ = _run_unalloc(monkeypatch, capsys, _UNALLOC_NEEDS, fetch)
+    assert code == 1
+
+
+def test_t14_later_page_is_read_and_counted(monkeypatch, capsys):
+    # 150 cancelled jobs: page 1 is full, so page 2 must be read before deciding.
+    jobs = _allocated_jobs(cancelled=150)
+    fetch, calls = _jobs_fetch(jobs)
+    code, out = _run_unalloc(monkeypatch, capsys, _UNALLOC_NEEDS, fetch)
+    assert code == 0, out
+    assert len(calls) == 2
+    assert "150/150 cancelled jobs never ran" in out
+
+
+def test_t15_successful_gate_never_calls_the_api(monkeypatch, capsys):
+    needs = {**_UNALLOC_NEEDS, "tests": {"result": "success"}, "tests-os": {"result": "success"}}
+    code, out = _run_unalloc(monkeypatch, capsys, needs, _raise)
+    assert code == 0
+    assert "All checks passed" in out
+
+
+def test_t16_no_waiver_when_detect_never_ran(monkeypatch, capsys):
+    # detect selects the required lanes; if it was itself cancelled we cannot know which
+    # consumers had to execute, so the exemption set is unknown and the waiver is refused.
+    needs = {**_UNALLOC_NEEDS, "detect": {"result": "cancelled", "outputs": {}}}
+    fetch, calls = _jobs_fetch(_allocated_jobs())
+    code, out = _run_unalloc(monkeypatch, capsys, needs, fetch)
+    assert code == 1
+    assert "::error::" in out
+    assert calls == []          # no evidence lookup at all
+
+
+# The production pairing: ci.yaml passes --allow-unallocated AND --allow-superseded
+# together on every pull_request run. Both paths can green a cancelled gate, so their
+# precedence is a production behaviour, not an option.
+def _both_fetch(jobs, runs=None):
+    jobs_serve, _ = _jobs_fetch(jobs)
+    runs_serve, runs_calls = _fake_fetch(runs or [])
+
+    def fetch(path):
+        return jobs_serve(path) if "/jobs" in path else runs_serve(path)
+    return fetch, runs_calls
+
+
+def test_t17_both_flags_waiver_wins_and_never_asks_about_duplicates(monkeypatch, capsys):
+    fetch, runs_calls = _both_fetch(_allocated_jobs(), runs=[_dup(status="in_progress")])
+    code, out = _run_unalloc(monkeypatch, capsys, _UNALLOC_NEEDS, fetch,
+                             argv=("--allow-unallocated", "--allow-superseded"))
+    assert code == 0, out
+    assert "::warning::Unallocated jobs" in out
+    assert "::notice::" not in out
+    assert runs_calls == []          # the waiver settles it; no duplicate lookup
+    assert out.count("All checks passed") == 1
+
+
+def test_t18_both_flags_declined_waiver_falls_through_to_the_duplicate_run(monkeypatch, capsys):
+    # One cancelled job DID run, so the waiver declines; a later live duplicate run then
+    # carries the verdict through the pre-existing --allow-superseded path.
+    jobs = _allocated_jobs() + [_job(runner="GitHub Actions 9", steps=[{"name": "run"}])]
+    fetch, runs_calls = _both_fetch(jobs, runs=[_dup(status="in_progress")])
+    code, out = _run_unalloc(monkeypatch, capsys, _UNALLOC_NEEDS, fetch,
+                             argv=("--allow-unallocated", "--allow-superseded"))
+    assert code == 0, out
+    assert "Not downgrading to unallocated" in out
+    assert "::notice::Cancelled duplicate run" in out
+    assert "::warning::Unallocated jobs" not in out
+    assert runs_calls                  # the duplicate lookup did happen
+
+
+@pytest.mark.parametrize("env", ["GITHUB_RUN_ID", "GITHUB_REPOSITORY"])
+def test_t19_missing_run_identity_fails_closed(monkeypatch, capsys, env):
+    monkeypatch.setenv("GITHUB_REPOSITORY", "o/r")
+    monkeypatch.setenv("GITHUB_RUN_ID", "1")
+    monkeypatch.delenv(env, raising=False)
+    monkeypatch.setattr(sys, "stdin", __import__("io").StringIO(json.dumps(_UNALLOC_NEEDS)))
+    monkeypatch.delenv("GITHUB_OUTPUT", raising=False)
+    code = required_results.main(["--allow-unallocated"], fetch=_raise)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "keeping the failure" in out or "Not downgrading" in out

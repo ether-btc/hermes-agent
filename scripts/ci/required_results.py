@@ -28,7 +28,17 @@ attempt 2 of a fork run whose attempt 1 only waited for approval. Any other
 rerun, failure, missing job, API error or lack of such a run keeps the gate
 failing.
 
-    echo "$NEEDS" | python3 scripts/ci/required_results.py [--release | --allow-superseded]
+``--allow-unallocated`` (never release): a ``cancelled`` job can also mean the job
+never ran at all. On a plan that cannot allocate a pinned runner label (this fork pins
+GitHub *larger* hosted runners on some lanes), GitHub holds the job in the queue for its
+24 h maximum and then cancels it with ``steps == []`` and ``runner_name == ""``. With the
+flag, a gate failed only by ``cancelled`` jobs may pass when the run's evidence says
+every one of its cancelled jobs never executed (no steps, no runner), every one of them
+pinned a known unallocatable label, the run did allocate at least one job, the job list
+was read completely, and no failed entry is a required update/E2E consumer. Any API
+error, truncation or ambiguity keeps the failure.
+
+    echo "$NEEDS" | python3 scripts/ci/required_results.py [--release | --allow-superseded | --allow-unallocated]
 """
 
 from __future__ import annotations
@@ -59,6 +69,18 @@ _UPDATE_CONSUMER_LANES = {
     "catalog-tests": ("catalog",),
 }
 
+# GitHub larger hosted runners (Team/Enterprise only). A job pinned to one of these
+# labels cannot be allocated on this repository's plan, so it waits out GitHub's 24 h
+# queue maximum and is cancelled with no steps and no runner. Measured 2026-11-19 on
+# run 43947376952. `macos-latest` is deliberately absent: a cancel there is re-runnable.
+UNALLOCATABLE_LABELS = frozenset({
+    "ubuntu-latest-32-core",
+    "windows-latest-32-core",
+    "windows-latest-32-arm-core",
+})
+_JOBS_PER_PAGE = 100
+_MAX_JOB_PAGES = 10
+
 
 def evaluate_gate(
     needs: dict[str, dict[str, Any]] | None,
@@ -72,9 +94,7 @@ def evaluate_gate(
     failed: list[str] = []
     allowed_skips: list[str] = []
     entries = needs or {}
-    lanes = (entries.get("detect") or {}).get("outputs") or {}
-    required = {job for job, keys in _UPDATE_CONSUMER_LANES.items()
-                if any(lanes.get(key) in ("true", True) for key in keys)}
+    required = required_consumers(entries)
     if not entries:
         failed.append("<no-needs>")
     failed.extend(required - entries.keys())
@@ -90,7 +110,15 @@ def evaluate_gate(
         "ok": not failed,
         "failed": sorted(failed),
         "allowed_skips": sorted(allowed_skips),
+        "unallocated": [],
     }
+
+
+def required_consumers(entries: dict[str, dict[str, Any]]) -> set[str]:
+    """Update/E2E consumer jobs selected by ``detect.outputs``; they must execute."""
+    lanes = (entries.get("detect") or {}).get("outputs") or {}
+    return {job for job, keys in _UPDATE_CONSUMER_LANES.items()
+            if any(lanes.get(key) in ("true", True) for key in keys)}
 
 
 _LIVE_STATUSES = frozenset({"queued", "in_progress", "waiting", "pending", "requested"})
@@ -195,6 +223,56 @@ def superseding_run_id(fetch: Callable[[str], Any] = _github_get) -> int | None:
     return None
 
 
+def _classify_jobs(jobs: list[dict[str, Any]]) -> dict[str, Any]:
+    """Count executed/cancelled/unallocated jobs and whether the labels are pinned."""
+    executed = sum(1 for job in jobs if job.get("runner_name"))
+    cancelled = [job for job in jobs if job.get("conclusion") == "cancelled"]
+    unallocated = [job for job in cancelled
+                   if not (job.get("steps") or []) and not job.get("runner_name")]
+    labels_ok = all(set(job.get("labels") or []) <= UNALLOCATABLE_LABELS for job in cancelled)
+    return {"executed_total": executed, "cancelled_total": len(cancelled),
+            "unallocated_total": len(unallocated), "labels_ok": labels_ok}
+
+
+def unallocated_verdict(fetch: Callable[[str], Any] = _github_get) -> tuple[bool, str]:
+    # Known residual (plan S5/R2, review F4): this evidence proves the RUN, not the
+    # individual needs entries — the API exposes no needs-key <-> job-name mapping, so a
+    # cancelled entry whose jobs never appear in the list could ride along with unrelated
+    # pinned cancels. It is not constructible against today's API (every needs-cancelled
+    # job does appear in the run's job list), but it is the assumption this waiver rests
+    # on: keep it in mind before widening the rule.
+    """(may_downgrade, why) from this run's job list; every fault path returns False."""
+    repo = os.environ["GITHUB_REPOSITORY"]
+    run_id = int(os.environ["GITHUB_RUN_ID"])
+    jobs: list[dict[str, Any]] = []
+    total: Any = None
+    for page in range(1, _MAX_JOB_PAGES + 1):
+        payload = fetch(f"repos/{repo}/actions/runs/{run_id}/jobs"
+                        f"?per_page={_JOBS_PER_PAGE}&page={page}")
+        if not isinstance(payload, dict):
+            return False, "job list unreadable"
+        total = payload.get("total_count")
+        batch = payload.get("jobs") or []
+        jobs.extend(batch)
+        if len(batch) < _JOBS_PER_PAGE:
+            break
+    counts = _classify_jobs(jobs)
+    truncated = not isinstance(total, int) or len(jobs) != total
+    # One expression, never split: a fault or a partial view must never read as clean.
+    may = (not truncated
+           and counts["executed_total"] > 0
+           and counts["cancelled_total"] > 0
+           and counts["unallocated_total"] == counts["cancelled_total"]
+           and counts["labels_ok"] is True)
+    why = (f"{counts['unallocated_total']}/{counts['cancelled_total']} cancelled jobs never ran "
+           f"(no steps, no runner); {counts['executed_total']} job(s) did allocate"
+           if may else
+           f"not every cancelled job is unallocated (executed={counts['executed_total']}, "
+           f"cancelled={counts['cancelled_total']}, unallocated={counts['unallocated_total']}, "
+           f"labels_ok={counts['labels_ok']}, truncated={truncated})")
+    return may, why
+
+
 def compact_results(needs: dict[str, dict[str, Any]] | None) -> dict[str, str]:
     """{job_name: result} for every entry, for the PR comment assembler."""
     return {name: (info or {}).get("result", "") for name, info in (needs or {}).items()}
@@ -203,8 +281,12 @@ def compact_results(needs: dict[str, dict[str, Any]] | None) -> dict[str, str]:
 def render_report(needs: dict[str, dict[str, Any]] | None, verdict: dict[str, Any]) -> list[str]:
     """Per-job lines plus ::error:: annotations for the failed set."""
     lines: list[str] = []
+    unallocated = set(verdict.get("unallocated") or ())
     for name in sorted(needs or {}):
         result = (needs[name] or {}).get("result", "unknown")
+        if name in unallocated:
+            lines.append(f"🕳️ {name}: unallocated (no runner assigned) — non-blocking")
+            continue
         icon = {"success": "✅", "skipped": "⏭️"}.get(result, "❌")
         lines.append(f"{icon} {name}: {result}")
     if verdict["failed"]:
@@ -225,9 +307,14 @@ def main(argv: list[str] | None = None, fetch: Callable[[str], Any] = _github_ge
         action="store_true",
         help="Pass a gate failed only by cancelled jobs when a newer duplicate run of the same head SHA is live.",
     )
+    parser.add_argument(
+        "--allow-unallocated",
+        action="store_true",
+        help="Pass a gate failed only by cancelled jobs when the run shows every cancelled job never executed on an unallocatable runner label.",
+    )
     args = parser.parse_args(argv)
-    if args.release and args.allow_superseded:
-        parser.error("--allow-superseded never applies to release runs")
+    if args.release and (args.allow_superseded or args.allow_unallocated):
+        parser.error("--allow-superseded/--allow-unallocated never apply to release runs")
 
     needs = json.load(sys.stdin)
     verdict = evaluate_gate(needs, release=args.release)
@@ -239,6 +326,27 @@ def main(argv: list[str] | None = None, fetch: Callable[[str], Any] = _github_ge
             fh.write(f"{NEEDS_JSON_OUTPUT}={json.dumps(compact)}\n")
 
     print(f"{NEEDS_JSON_OUTPUT}={json.dumps(compact)}")
+    # A required consumer that never ran can never be waived: the gate must stay honest
+    # about the lanes it is meant to guarantee.
+    exempt = sorted(set(verdict["failed"]) & required_consumers(needs or {}))
+    detect_ran = ((needs or {}).get("detect") or {}).get("result") == "success"
+    unallocated: list[str] = []
+    unallocated_why = ""
+    # `detect` decides which lanes are required; if it never ran, the required set is
+    # unknown, so the waiver cannot be applied honestly.
+    if args.allow_unallocated and detect_ran and not exempt and only_cancellations(needs, verdict):
+        try:
+            may, unallocated_why = unallocated_verdict(fetch)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:  # fail closed
+            print(f"Unallocated-run evidence unavailable, keeping the failure: {exc}")
+        else:
+            if may:
+                unallocated = list(verdict["failed"])
+                verdict["unallocated"] = sorted(unallocated)
+                verdict["failed"] = []
+                verdict["ok"] = True
+            else:
+                print(f"Not downgrading to unallocated: {unallocated_why}")
     duplicate = None
     if args.allow_superseded and only_cancellations(needs, verdict):
         try:
@@ -248,6 +356,9 @@ def main(argv: list[str] | None = None, fetch: Callable[[str], Any] = _github_ge
     for line in render_report(needs, verdict):
         if duplicate is None or not line.startswith("::error::"):
             print(line)
+    if unallocated:
+        print(f"::warning::Unallocated jobs (no runner assigned, non-blocking): "
+              f"{', '.join(unallocated)} — {unallocated_why}")
     if duplicate is not None:
         print(f"::notice::Cancelled duplicate run: run {duplicate} on the same head SHA "
               "carries the required verdict")

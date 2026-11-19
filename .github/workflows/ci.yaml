@@ -391,6 +391,14 @@ jobs:
         # workflow on the same head SHA, branch and head repository, whose gate
         # is the real verdict. Only a first executed attempt delegates, and only
         # forward, so no cycles.
+        # --allow-unallocated (non-release): a cancelled job may mean it never ran
+        # at all. On a plan that cannot allocate a pinned larger-runner label,
+        # GitHub holds the job for its 24 h queue maximum and cancels it with no
+        # steps and no runner. The gate then passes only when this run's API
+        # evidence says every cancelled job never executed on a known
+        # unallocatable label, at least one job did allocate, the job list was
+        # read completely, and no failed entry is a required update/E2E consumer.
+        # Any error, truncation or ambiguity keeps the failure.
         env:
           NEEDS: ${{ toJSON(needs) }}
           RELEASE: ${{ inputs.release }}
@@ -398,8 +406,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           args=()
-          if [ "$RELEASE" = true ]; then args+=(--release);
-          elif [ "$EVENT_NAME" = pull_request ]; then args+=(--allow-superseded); fi
+          if [ "$RELEASE" = true ]; then
+            args+=(--release)
+          else
+            args+=(--allow-unallocated)
+            if [ "$EVENT_NAME" = pull_request ]; then args+=(--allow-superseded); fi
+          fi
           printf '%s' "$NEEDS" | python3 scripts/ci/required_results.py "${args[@]}"
 
       # ───────────────────────────────────────────────────────────────────
